@@ -13,9 +13,11 @@ craneLib.buildPackage (commonArgs // {
 
   # Install the layer manifests into the *implicit* loader directories so that,
   # when this package is in environment.systemPackages (which links share/ into
-  # /run/current-system/sw/share, on XDG_DATA_DIRS), both loaders auto-load the
-  # layers with no per-app configuration. The shared registry is found next to
-  # the layers via dladdr, so no LD_LIBRARY_PATH is required.
+  # /run/current-system/sw/share, on XDG_DATA_DIRS), both loaders discover the
+  # layers automatically. They only engage when ENABLE_FFR_VRS=1 is set
+  # (manifest enable_environment), so they are inert in other apps by default.
+  # The shared registry is found next to the layers via dladdr, so no
+  # LD_LIBRARY_PATH is required.
   postInstall = ''
     mkdir -p \
       $out/lib \

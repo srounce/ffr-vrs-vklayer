@@ -35,16 +35,18 @@ env:
     #!/usr/bin/env bash
     out="$(nix build .#layers --no-link --print-out-paths)"
     echo "export XDG_DATA_DIRS=$out/share:\${XDG_DATA_DIRS:-/usr/local/share:/usr/share}"
+    echo "export ENABLE_FFR_VRS=1"
     echo "export FFR_VRS_LOG=debug"
 
-# Build the layers and run the test app with the layers auto-loaded via
-# XDG_DATA_DIRS (no per-app enable needed — they are implicit). Needs a running
+# Build the layers and run the test app. The layers are discovered as implicit
+# layers via XDG_DATA_DIRS and gated on by ENABLE_FFR_VRS=1. Needs a running
 # OpenXR runtime such as `monado-service`.
 run-app *ARGS:
     #!/usr/bin/env bash
     set -euo pipefail
     out="$(nix build .#layers --no-link --print-out-paths)"
     export XDG_DATA_DIRS="$out/share:${XDG_DATA_DIRS:-/usr/local/share:/usr/share}"
+    export ENABLE_FFR_VRS=1
     export FFR_VRS_LOG="${FFR_VRS_LOG:-debug}"
     echo "FFR layers auto-loaded (implicit) from: $out"
     cargo run -p ffr-test-app -- {{ ARGS }}
@@ -55,17 +57,19 @@ debug-loaders *ARGS:
     set -euo pipefail
     out="$(nix build .#layers --no-link --print-out-paths)"
     export XDG_DATA_DIRS="$out/share:${XDG_DATA_DIRS:-/usr/local/share:/usr/share}"
+    export ENABLE_FFR_VRS=1
     export FFR_VRS_LOG="${FFR_VRS_LOG:-debug}"
     export VK_LOADER_DEBUG=layer
     export XRT_LOG=debug
     cargo run -p ffr-test-app -- {{ ARGS }}
 
-# Smoke test: with the implicit Vulkan layer discoverable via XDG_DATA_DIRS,
-# vulkaninfo should auto-load and list it (no force-enable needed).
+# Smoke test: the implicit Vulkan layer is discovered via XDG_DATA_DIRS and
+# enabled by ENABLE_FFR_VRS=1, so vulkaninfo should load and list it.
 smoke:
     #!/usr/bin/env bash
     set -euo pipefail
     out="$(nix build .#layers --no-link --print-out-paths)"
     export XDG_DATA_DIRS="$out/share:${XDG_DATA_DIRS:-/usr/local/share:/usr/share}"
+    export ENABLE_FFR_VRS=1
     echo "Implicit VK_LAYER_FFR_VRS_foveation discovered via XDG_DATA_DIRS; vulkaninfo says:"
     vulkaninfo 2>&1 | grep -iE 'VK_LAYER_FFR_VRS_foveation' | sort -u
