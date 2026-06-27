@@ -41,7 +41,7 @@ fn api() -> Option<&'static Api> {
 }
 
 unsafe fn load() -> Option<Api> {
-    let lib = Library::new("libffr_shared.so").ok()?;
+    let lib = open_shared()?;
     macro_rules! sym {
         ($t:ty, $name:expr) => {
             *lib.get::<$t>($name).ok()?
@@ -58,6 +58,31 @@ unsafe fn load() -> Option<Api> {
         _lib: lib,
     };
     Some(api)
+}
+
+/// Open `libffr_shared.so`. Prefer the copy sitting next to this object (works
+/// for implicit / system installs with no `LD_LIBRARY_PATH`); fall back to the
+/// normal loader search by soname.
+unsafe fn open_shared() -> Option<Library> {
+    if let Some(dir) = self_dir() {
+        let candidate = dir.join("libffr_shared.so");
+        if let Ok(lib) = Library::new(&candidate) {
+            return Some(lib);
+        }
+    }
+    Library::new("libffr_shared.so").ok()
+}
+
+/// Directory containing the shared object this code is linked into (i.e. the
+/// layer `.so`), via `dladdr` on one of our own functions.
+unsafe fn self_dir() -> Option<std::path::PathBuf> {
+    let mut info: libc::Dl_info = std::mem::zeroed();
+    let addr = self_dir as *const std::ffi::c_void;
+    if libc::dladdr(addr, &mut info) == 0 || info.dli_fname.is_null() {
+        return None;
+    }
+    let path = std::ffi::CStr::from_ptr(info.dli_fname).to_str().ok()?;
+    std::path::Path::new(path).parent().map(|p| p.to_path_buf())
 }
 
 /// Whether `libffr_shared.so` was found and its symbols resolved.

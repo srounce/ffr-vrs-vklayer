@@ -10,7 +10,6 @@
     "functions": {
       "vkNegotiateLoaderLayerInterfaceVersion": "vkNegotiateLoaderLayerInterfaceVersion"
     },
-    "enable_environment": { "ENABLE_FFR_VRS": "1" },
     "disable_environment": { "DISABLE_FFR_VRS": "1" }
   }
 }

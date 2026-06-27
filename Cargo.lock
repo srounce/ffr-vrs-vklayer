@@ -80,6 +80,7 @@ name = "ffr-registry"
 version = "0.1.0"
 dependencies = [
  "ffr-core",
+ "libc",
  "libloading",
 ]
 

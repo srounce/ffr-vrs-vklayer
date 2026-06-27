@@ -28,62 +28,44 @@ fmt:
 build-nix:
     nix build .#layers
 
-# Print env exports that point both loaders at the Nix build output.
-# Usage:  eval "$(just env)"   or   just env > .env.local && source .env.local
+# Print env exports that make the implicit layers discoverable, exactly as
+# `environment.systemPackages` does (it links share/ onto XDG_DATA_DIRS).
+# Usage:  eval "$(just env)"
 env:
     #!/usr/bin/env bash
     out="$(nix build .#layers --no-link --print-out-paths)"
-    echo "export VK_ADD_LAYER_PATH=$out/share/vulkan/explicit_layer.d"
-    echo "export VK_LOADER_LAYERS_ENABLE='VK_LAYER_FFR_VRS*'"
-    echo "export XR_API_LAYER_PATH=$out/share/openxr/1/api_layers/explicit.d"
-    echo "export XR_ENABLE_API_LAYERS=XR_APILAYER_FFRVRS_foveation"
-    echo "export LD_LIBRARY_PATH=$out/lib:\${LD_LIBRARY_PATH:-}"
+    echo "export XDG_DATA_DIRS=$out/share:\${XDG_DATA_DIRS:-/usr/local/share:/usr/share}"
     echo "export FFR_VRS_LOG=debug"
 
-# Build the layers, enable BOTH via env only (no system install), and run the
-# test app. The app creates an OpenXR instance (loading the OpenXR layer); it
-# needs a running runtime such as `monado-service`. Extra args are forwarded.
+# Build the layers and run the test app with the layers auto-loaded via
+# XDG_DATA_DIRS (no per-app enable needed — they are implicit). Needs a running
+# OpenXR runtime such as `monado-service`.
 run-app *ARGS:
     #!/usr/bin/env bash
     set -euo pipefail
     out="$(nix build .#layers --no-link --print-out-paths)"
-    # --- enable both layers from the build output, env only ---
-    export VK_ADD_LAYER_PATH="$out/share/vulkan/explicit_layer.d"
-    export VK_LOADER_LAYERS_ENABLE='VK_LAYER_FFR_VRS*'
-    export XR_API_LAYER_PATH="$out/share/openxr/1/api_layers/explicit.d"
-    export XR_ENABLE_API_LAYERS=XR_APILAYER_FFRVRS_foveation
-    export LD_LIBRARY_PATH="$out/lib:${LD_LIBRARY_PATH:-}"
+    export XDG_DATA_DIRS="$out/share:${XDG_DATA_DIRS:-/usr/local/share:/usr/share}"
     export FFR_VRS_LOG="${FFR_VRS_LOG:-debug}"
-    echo "FFR layers enabled from: $out"
+    echo "FFR layers auto-loaded (implicit) from: $out"
     cargo run -p ffr-test-app -- {{ ARGS }}
 
-# Same as run-app, but with loader debug to watch the layers join the chains.
+# Same as run-app, with loader debug to watch the layers join the chains.
 debug-loaders *ARGS:
     #!/usr/bin/env bash
     set -euo pipefail
     out="$(nix build .#layers --no-link --print-out-paths)"
-    export VK_ADD_LAYER_PATH="$out/share/vulkan/explicit_layer.d"
-    export VK_LOADER_LAYERS_ENABLE='VK_LAYER_FFR_VRS*'
-    export XR_API_LAYER_PATH="$out/share/openxr/1/api_layers/explicit.d"
-    export XR_ENABLE_API_LAYERS=XR_APILAYER_FFRVRS_foveation
-    export LD_LIBRARY_PATH="$out/lib:${LD_LIBRARY_PATH:-}"
+    export XDG_DATA_DIRS="$out/share:${XDG_DATA_DIRS:-/usr/local/share:/usr/share}"
     export FFR_VRS_LOG="${FFR_VRS_LOG:-debug}"
     export VK_LOADER_DEBUG=layer
     export XRT_LOG=debug
     cargo run -p ffr-test-app -- {{ ARGS }}
 
-# M0-meaningful smoke test: enable the Vulkan layer via env only and run
-# vulkaninfo (which actually creates a Vulkan instance). At M0 you'll see the
-# loader discover the layer and then "Skipping layer" (the negotiate entry
-# points arrive in M1); after M1 this shows the layer active with its banner.
+# Smoke test: with the implicit Vulkan layer discoverable via XDG_DATA_DIRS,
+# vulkaninfo should auto-load and list it (no force-enable needed).
 smoke:
     #!/usr/bin/env bash
     set -euo pipefail
     out="$(nix build .#layers --no-link --print-out-paths)"
-    export VK_ADD_LAYER_PATH="$out/share/vulkan/explicit_layer.d"
-    export VK_LOADER_LAYERS_ENABLE='VK_LAYER_FFR_VRS*'
-    export VK_LOADER_DEBUG=layer
-    echo "Enabled VK_LAYER_FFR_VRS_foveation from $out (env only). Loader says:"
-    vulkaninfo 2>&1 \
-      | grep -iE 'VK_LAYER_FFR_VRS_foveation|Negotiate|Skipping layer|forced enabled' \
-      | sort -u
+    export XDG_DATA_DIRS="$out/share:${XDG_DATA_DIRS:-/usr/local/share:/usr/share}"
+    echo "Implicit VK_LAYER_FFR_VRS_foveation discovered via XDG_DATA_DIRS; vulkaninfo says:"
+    vulkaninfo 2>&1 | grep -iE 'VK_LAYER_FFR_VRS_foveation' | sort -u

@@ -9,7 +9,6 @@
     "functions": {
       "xrNegotiateLoaderApiLayerInterface": "xrNegotiateLoaderApiLayerInterface"
     },
-    "enable_environment": "ENABLE_FFR_VRS_OXR",
     "disable_environment": "DISABLE_FFR_VRS_OXR"
   }
 }
