@@ -1,0 +1,17 @@
+[package]
+name = "ffr-shared"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[lib]
+name = "ffr_shared"
+# The SINGLE process-global owner of cross-layer state. Built as one cdylib so
+# the dynamic loader maps exactly one copy (soname-deduped); both layers link
+# it dynamically and share its globals.
+crate-type = ["cdylib"]
+
+[dependencies]
+ffr-core = { workspace = true }
+once_cell = { workspace = true }

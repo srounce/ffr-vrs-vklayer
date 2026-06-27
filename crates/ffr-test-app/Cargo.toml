@@ -1,0 +1,17 @@
+[package]
+name = "ffr-test-app"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "ffr-test-app"
+path = "src/main.rs"
+
+[dependencies]
+ffr-core = { workspace = true }
+ash = { workspace = true }
+glam = "0.29"
+# High-level OpenXR wrapper; loads the loader at runtime (no build-time link).
+openxr = "0.19"

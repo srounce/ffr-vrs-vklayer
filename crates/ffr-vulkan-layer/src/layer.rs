@@ -1,0 +1,1066 @@
+//! Hand-rolled Vulkan layer dispatch.
+//!
+//! M1 scope: negotiate the loader interface, advance the instance/device
+//! dispatch chains, forward every call straight through, and log a banner at
+//! `vkCreateInstance` / `vkCreateDevice`. The interception points for VRS
+//! (device feature enable, pipeline recreation, `vkCmdBeginRendering`) are added
+//! to this same dispatch in later milestones.
+
+use std::collections::HashMap;
+use std::ffi::CStr;
+use std::mem::{transmute, transmute_copy};
+use std::os::raw::{c_char, c_void};
+use std::ptr;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Mutex, RwLock};
+
+use ash::vk::{self, Handle};
+use ffr_core::rate::ShadingRate;
+use once_cell::sync::Lazy;
+use tracing::{info, warn};
+
+use crate::vk_sys::*;
+
+const FSR_EXT_NAME: &CStr = c"VK_KHR_fragment_shading_rate";
+
+/// Kill switch: when `FFR_VRS_DISABLE` is set the layer stays in the call chain
+/// but injects nothing (for A/B comparison and emergency bypass).
+static KILL: Lazy<bool> = Lazy::new(|| std::env::var_os("FFR_VRS_DISABLE").is_some());
+
+/// When `FFR_VRS_DEBUG` is set, dump each eye's shading-rate map as a PPM image
+/// (false-colored by rate) so the foveation pattern can be inspected.
+static DEBUG: Lazy<bool> = Lazy::new(|| std::env::var_os("FFR_VRS_DEBUG").is_some());
+
+/// Down-chain instance state, keyed by `VkInstance` handle.
+struct InstanceData {
+    next_gipa: PfnGetInstanceProcAddr,
+    destroy_instance: vk::PFN_vkDestroyInstance,
+    enumerate_physical_devices: vk::PFN_vkEnumeratePhysicalDevices,
+    get_physical_device_properties: vk::PFN_vkGetPhysicalDeviceProperties,
+    /// ash wrapper over the down-chain instance functions (for VRS cap queries).
+    instance: ash::Instance,
+}
+
+/// Fragment-shading-rate capabilities resolved at device creation.
+#[derive(Clone, Copy)]
+struct VrsCaps {
+    /// Attachment texel size (framebuffer pixels per shading-rate-map texel).
+    texel_size: vk::Extent2D,
+}
+
+/// A lazily-created shading-rate attachment image holding one eye's radial
+/// foveation map. Cached per eye; rebuilt if the eye's render area / optical
+/// center / falloff changes.
+struct VrsImage {
+    image: vk::Image,
+    memory: vk::DeviceMemory,
+    view: vk::ImageView,
+    /// The render-area parameters this map was built for (change detection).
+    area_w: u32,
+    area_h: u32,
+    center_x: f32,
+    center_y: f32,
+    falloff: ffr_core::wire::FalloffParams,
+}
+
+impl VrsImage {
+    fn matches(&self, area_w: u32, area_h: u32, cx: f32, cy: f32, f: &ffr_core::wire::FalloffParams) -> bool {
+        self.area_w == area_w
+            && self.area_h == area_h
+            && (self.center_x - cx).abs() < 1.0
+            && (self.center_y - cy).abs() < 1.0
+            && self.falloff == *f
+    }
+}
+
+/// Down-chain device state, keyed by `VkDevice` handle.
+struct DeviceData {
+    next_gdpa: PfnGetDeviceProcAddr,
+    /// ash wrapper over the down-chain device functions (for our own GPU work).
+    device: ash::Device,
+    /// `Some` if attachment-based VRS is available + enabled on this device.
+    vrs: Option<VrsCaps>,
+    /// A graphics queue family the app created (for our one-shot init submits).
+    queue_family: u32,
+    /// Device memory properties (for allocating the shading-rate image).
+    mem_props: vk::PhysicalDeviceMemoryProperties,
+    /// Per-eye shading-rate images, created on first injection for each eye.
+    vrs_images: Mutex<HashMap<u32, VrsImage>>,
+}
+
+static INSTANCES: Lazy<RwLock<HashMap<u64, InstanceData>>> =
+    Lazy::new(|| RwLock::new(HashMap::new()));
+static PHYS_TO_INSTANCE: Lazy<RwLock<HashMap<u64, u64>>> =
+    Lazy::new(|| RwLock::new(HashMap::new()));
+static DEVICES: Lazy<RwLock<HashMap<u64, DeviceData>>> =
+    Lazy::new(|| RwLock::new(HashMap::new()));
+/// `VkImageView` handle → its underlying `VkImage` handle.
+static VIEW_TO_IMAGE: Lazy<RwLock<HashMap<u64, u64>>> =
+    Lazy::new(|| RwLock::new(HashMap::new()));
+/// `VkCommandBuffer` handle → the `VkDevice` it was allocated from.
+static CB_TO_DEVICE: Lazy<RwLock<HashMap<u64, u64>>> =
+    Lazy::new(|| RwLock::new(HashMap::new()));
+
+static LOGGED_RECOGNIZE: AtomicBool = AtomicBool::new(false);
+static LOGGED_INJECT: AtomicBool = AtomicBool::new(false);
+
+/// Cast a layer entry-point fn item into the loader's `PFN_vkVoidFunction`.
+macro_rules! vk_fn {
+    ($f:expr) => {
+        Some(unsafe { transmute::<*const (), unsafe extern "system" fn()>($f as *const ()) })
+    };
+}
+
+/// Reinterpret a `PFN_vkVoidFunction` returned by a down-chain proc-addr as a
+/// concrete function-pointer type. All Vulkan function pointers (and the
+/// niche-optimized `Option<fn()>`) are pointer-sized, so this is layout-safe.
+/// The caller must ensure `f` is `Some` before calling the result.
+#[inline]
+unsafe fn pfn<T: Copy>(f: vk::PFN_vkVoidFunction) -> T {
+    transmute_copy::<vk::PFN_vkVoidFunction, T>(&f)
+}
+
+// ---------------------------------------------------------------------------
+// Loader negotiation
+// ---------------------------------------------------------------------------
+
+/// Exported entry point the loader calls first (named in the layer manifest).
+///
+/// # Safety
+/// `p` must be null or point to a valid `VkNegotiateLayerInterface` the loader
+/// owns for the duration of the call (the standard loader contract).
+#[no_mangle]
+pub unsafe extern "system" fn vkNegotiateLoaderLayerInterfaceVersion(
+    p: *mut VkNegotiateLayerInterface,
+) -> vk::Result {
+    crate::logging::init();
+    if !p.is_null() {
+        let iface = &mut *p;
+        // Speak at most version 2; clamp to what the loader offers.
+        iface.loader_layer_interface_version = iface.loader_layer_interface_version.min(2);
+        iface.pfn_get_instance_proc_addr = Some(get_instance_proc_addr);
+        iface.pfn_get_device_proc_addr = Some(get_device_proc_addr);
+        iface.pfn_get_physical_device_proc_addr = None;
+        info!(
+            "FFR Vulkan layer ({} v{}) negotiated loader interface v{}",
+            env!("CARGO_PKG_NAME"),
+            env!("CARGO_PKG_VERSION"),
+            iface.loader_layer_interface_version
+        );
+    }
+    vk::Result::SUCCESS
+}
+
+// ---------------------------------------------------------------------------
+// proc-addr routing
+// ---------------------------------------------------------------------------
+
+pub unsafe extern "system" fn get_instance_proc_addr(
+    instance: vk::Instance,
+    p_name: *const c_char,
+) -> vk::PFN_vkVoidFunction {
+    crate::logging::init();
+    if p_name.is_null() {
+        return None;
+    }
+    match CStr::from_ptr(p_name).to_bytes() {
+        b"vkGetInstanceProcAddr" => return vk_fn!(get_instance_proc_addr),
+        b"vkCreateInstance" => return vk_fn!(create_instance),
+        b"vkDestroyInstance" => return vk_fn!(destroy_instance),
+        b"vkEnumeratePhysicalDevices" => return vk_fn!(enumerate_physical_devices),
+        b"vkCreateDevice" => return vk_fn!(create_device),
+        b"vkGetDeviceProcAddr" => return vk_fn!(get_device_proc_addr),
+        _ => {}
+    }
+    // Not ours — forward to the next layer's instance proc-addr.
+    let next = INSTANCES.read().unwrap().get(&instance.as_raw()).map(|d| d.next_gipa);
+    match next {
+        Some(next_gipa) => next_gipa(instance, p_name),
+        None => None,
+    }
+}
+
+pub unsafe extern "system" fn get_device_proc_addr(
+    device: vk::Device,
+    p_name: *const c_char,
+) -> vk::PFN_vkVoidFunction {
+    if p_name.is_null() {
+        return None;
+    }
+    match CStr::from_ptr(p_name).to_bytes() {
+        b"vkGetDeviceProcAddr" => return vk_fn!(get_device_proc_addr),
+        b"vkDestroyDevice" => return vk_fn!(destroy_device),
+        b"vkCreateImageView" => return vk_fn!(create_image_view),
+        b"vkDestroyImageView" => return vk_fn!(destroy_image_view),
+        b"vkAllocateCommandBuffers" => return vk_fn!(allocate_command_buffers),
+        b"vkCmdBeginRendering" => return vk_fn!(cmd_begin_rendering),
+        b"vkCreateGraphicsPipelines" => return vk_fn!(create_graphics_pipelines),
+        _ => {}
+    }
+    let next = DEVICES.read().unwrap().get(&device.as_raw()).map(|d| d.next_gdpa);
+    match next {
+        Some(next_gdpa) => next_gdpa(device, p_name),
+        None => None,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Instance lifecycle
+// ---------------------------------------------------------------------------
+
+unsafe extern "system" fn create_instance(
+    p_create_info: *const vk::InstanceCreateInfo,
+    p_allocator: *const vk::AllocationCallbacks,
+    p_instance: *mut vk::Instance,
+) -> vk::Result {
+    crate::logging::init();
+
+    let layer_ci = find_instance_chain_info(p_create_info);
+    if layer_ci.is_null() {
+        warn!("vkCreateInstance: no layer chain info found; cannot dispatch");
+        return vk::Result::ERROR_INITIALIZATION_FAILED;
+    }
+    let link = (*layer_ci).u.p_layer_info;
+    let next_gipa = (*link).pfn_next_get_instance_proc_addr;
+    // Advance the chain so the next layer consumes its own link.
+    (*layer_ci).u.p_layer_info = (*link).p_next;
+
+    let next_create = next_gipa(vk::Instance::null(), c"vkCreateInstance".as_ptr());
+    if next_create.is_none() {
+        return vk::Result::ERROR_INITIALIZATION_FAILED;
+    }
+    let create: vk::PFN_vkCreateInstance = pfn(next_create);
+    let res = create(p_create_info, p_allocator, p_instance);
+    if res != vk::Result::SUCCESS {
+        return res;
+    }
+
+    let instance = *p_instance;
+    let load = |name: &CStr| next_gipa(instance, name.as_ptr());
+    // ash wrapper whose functions resolve through the *next* layer's GIPA, so
+    // our own calls go straight down the chain (below us) to the driver.
+    let static_fn = ash::StaticFn { get_instance_proc_addr: next_gipa };
+    let ash_instance = ash::Instance::load(&static_fn, instance);
+    let data = InstanceData {
+        next_gipa,
+        destroy_instance: pfn(load(c"vkDestroyInstance")),
+        enumerate_physical_devices: pfn(load(c"vkEnumeratePhysicalDevices")),
+        get_physical_device_properties: pfn(load(c"vkGetPhysicalDeviceProperties")),
+        instance: ash_instance,
+    };
+    INSTANCES.write().unwrap().insert(instance.as_raw(), data);
+
+    info!(
+        "vkCreateInstance ok: app={:?} api={}",
+        app_name(p_create_info),
+        app_api_version(p_create_info)
+    );
+
+    // M2: read back the heartbeat the OpenXR layer published, proving both
+    // cdylibs share the one libffr_shared.so state.
+    match ffr_registry::get_heartbeat() {
+        Some((counter, ppd)) => info!(
+            "read heartbeat #{counter} (ppd={ppd}) from ffr-shared — cross-layer channel OK"
+        ),
+        None => {
+            if ffr_registry::is_available() {
+                info!("ffr-shared loaded but no heartbeat yet (OpenXR layer not run in this process)");
+            } else {
+                warn!("ffr-shared not found; cross-layer channel unavailable");
+            }
+        }
+    }
+    res
+}
+
+unsafe extern "system" fn destroy_instance(
+    instance: vk::Instance,
+    p_allocator: *const vk::AllocationCallbacks,
+) {
+    let data = INSTANCES.write().unwrap().remove(&instance.as_raw());
+    PHYS_TO_INSTANCE
+        .write()
+        .unwrap()
+        .retain(|_, inst| *inst != instance.as_raw());
+    if let Some(d) = data {
+        (d.destroy_instance)(instance, p_allocator);
+    }
+}
+
+unsafe extern "system" fn enumerate_physical_devices(
+    instance: vk::Instance,
+    p_count: *mut u32,
+    p_phys: *mut vk::PhysicalDevice,
+) -> vk::Result {
+    let down = INSTANCES
+        .read()
+        .unwrap()
+        .get(&instance.as_raw())
+        .map(|d| d.enumerate_physical_devices);
+    let Some(down) = down else {
+        return vk::Result::ERROR_INITIALIZATION_FAILED;
+    };
+    let res = down(instance, p_count, p_phys);
+    if !p_phys.is_null() && (res == vk::Result::SUCCESS || res == vk::Result::INCOMPLETE) {
+        let n = *p_count as usize;
+        let mut map = PHYS_TO_INSTANCE.write().unwrap();
+        for i in 0..n {
+            let pd = *p_phys.add(i);
+            map.insert(pd.as_raw(), instance.as_raw());
+        }
+    }
+    res
+}
+
+// ---------------------------------------------------------------------------
+// Device lifecycle
+// ---------------------------------------------------------------------------
+
+unsafe extern "system" fn create_device(
+    physical_device: vk::PhysicalDevice,
+    p_create_info: *const vk::DeviceCreateInfo,
+    p_allocator: *const vk::AllocationCallbacks,
+    p_device: *mut vk::Device,
+) -> vk::Result {
+    let layer_ci = find_device_chain_info(p_create_info);
+    if layer_ci.is_null() {
+        warn!("vkCreateDevice: no layer chain info found; cannot dispatch");
+        return vk::Result::ERROR_INITIALIZATION_FAILED;
+    }
+    let link = (*layer_ci).u.p_layer_info;
+    let next_gipa = (*link).pfn_next_get_instance_proc_addr;
+    let next_gdpa = (*link).pfn_next_get_device_proc_addr;
+    (*layer_ci).u.p_layer_info = (*link).p_next;
+
+    let instance_raw = PHYS_TO_INSTANCE
+        .read()
+        .unwrap()
+        .get(&physical_device.as_raw())
+        .copied();
+    let instance = instance_raw
+        .map(vk::Instance::from_raw)
+        .unwrap_or(vk::Instance::null());
+
+    // Decide whether to enable attachment-based VRS on this device.
+    let caps = instance_raw.and_then(|ir| query_vrs(ir, physical_device));
+    let already_enabled = device_has_extension(p_create_info, FSR_EXT_NAME);
+    let do_enable = caps.is_some() && !already_enabled;
+
+    // Build a (possibly) modified create info that adds the extension + feature.
+    // These locals must outlive the down-call below.
+    let mut ext_ptrs: Vec<*const c_char> = Vec::new();
+    let mut fsr_feature = vk::PhysicalDeviceFragmentShadingRateFeaturesKHR::default();
+    let mut modified = *p_create_info;
+    if do_enable {
+        let existing = std::slice::from_raw_parts(
+            (*p_create_info).pp_enabled_extension_names,
+            (*p_create_info).enabled_extension_count as usize,
+        );
+        ext_ptrs.extend_from_slice(existing);
+        ext_ptrs.push(FSR_EXT_NAME.as_ptr());
+        modified.pp_enabled_extension_names = ext_ptrs.as_ptr();
+        modified.enabled_extension_count = ext_ptrs.len() as u32;
+
+        fsr_feature.attachment_fragment_shading_rate = vk::TRUE;
+        fsr_feature.p_next = (*p_create_info).p_next as *mut c_void;
+        modified.p_next = (&fsr_feature as *const vk::PhysicalDeviceFragmentShadingRateFeaturesKHR)
+            .cast::<c_void>();
+    }
+    let ci_ptr: *const vk::DeviceCreateInfo = if do_enable { &modified } else { p_create_info };
+
+    let next_create = next_gipa(instance, c"vkCreateDevice".as_ptr());
+    if next_create.is_none() {
+        return vk::Result::ERROR_INITIALIZATION_FAILED;
+    }
+    let create: vk::PFN_vkCreateDevice = pfn(next_create);
+    let res = create(physical_device, ci_ptr, p_allocator, p_device);
+    if res != vk::Result::SUCCESS {
+        return res;
+    }
+
+    let device = *p_device;
+    let queue_family = first_queue_family(p_create_info);
+    // ash device whose functions resolve through the next layer's device
+    // proc-addr (so our own calls go straight down to the driver).
+    let gdpa_ptr = next_gdpa as *const c_void;
+    let inst_fn = ash::InstanceFnV1_0::load(|name| {
+        if name.to_bytes() == c"vkGetDeviceProcAddr".to_bytes() {
+            gdpa_ptr
+        } else {
+            ptr::null()
+        }
+    });
+    let ash_device = ash::Device::load(&inst_fn, device);
+
+    let mem_props = {
+        let map = INSTANCES.read().unwrap();
+        match instance_raw.and_then(|ir| map.get(&ir)) {
+            Some(inst) => inst.instance.get_physical_device_memory_properties(physical_device),
+            None => vk::PhysicalDeviceMemoryProperties::default(),
+        }
+    };
+
+    DEVICES.write().unwrap().insert(
+        device.as_raw(),
+        DeviceData {
+            next_gdpa,
+            device: ash_device,
+            vrs: caps,
+            queue_family,
+            mem_props,
+            vrs_images: Mutex::new(HashMap::new()),
+        },
+    );
+
+    match caps {
+        Some(c) => info!(
+            "vkCreateDevice ok on GPU {}: attachment VRS {} (texel {}x{})",
+            gpu_name(instance_raw, physical_device),
+            if do_enable { "enabled by layer" } else { "already enabled by app" },
+            c.texel_size.width,
+            c.texel_size.height
+        ),
+        None => info!(
+            "vkCreateDevice ok on GPU {}: VRS unavailable; passing through",
+            gpu_name(instance_raw, physical_device)
+        ),
+    }
+    res
+}
+
+unsafe extern "system" fn destroy_device(
+    device: vk::Device,
+    p_allocator: *const vk::AllocationCallbacks,
+) {
+    let data = DEVICES.write().unwrap().remove(&device.as_raw());
+    if let Some(d) = data {
+        let images: Vec<VrsImage> =
+            d.vrs_images.lock().unwrap().drain().map(|(_, v)| v).collect();
+        for img in &images {
+            destroy_vrs_image(&d, img);
+        }
+        // Down-chain destroy via the ash wrapper (honors the app's allocator).
+        d.device.destroy_device(p_allocator.as_ref());
+    }
+}
+
+/// Query attachment-VRS support for a physical device and return the chosen
+/// attachment texel size, or `None` if unsupported.
+unsafe fn query_vrs(instance_raw: u64, phys: vk::PhysicalDevice) -> Option<VrsCaps> {
+    let map = INSTANCES.read().unwrap();
+    let inst = &map.get(&instance_raw)?.instance;
+
+    let exts = inst.enumerate_device_extension_properties(phys).ok()?;
+    let has_ext = exts.iter().any(|e| {
+        CStr::from_ptr(e.extension_name.as_ptr()).to_bytes() == FSR_EXT_NAME.to_bytes()
+    });
+    if !has_ext {
+        return None;
+    }
+
+    let mut feature = vk::PhysicalDeviceFragmentShadingRateFeaturesKHR::default();
+    let mut features2 = vk::PhysicalDeviceFeatures2::default().push_next(&mut feature);
+    inst.get_physical_device_features2(phys, &mut features2);
+    if feature.attachment_fragment_shading_rate != vk::TRUE {
+        return None;
+    }
+
+    let mut props = vk::PhysicalDeviceFragmentShadingRatePropertiesKHR::default();
+    let mut props2 = vk::PhysicalDeviceProperties2::default().push_next(&mut props);
+    inst.get_physical_device_properties2(phys, &mut props2);
+
+    let texel_size = props.max_fragment_shading_rate_attachment_texel_size;
+    if texel_size.width == 0 || texel_size.height == 0 {
+        return None;
+    }
+    Some(VrsCaps { texel_size })
+}
+
+/// Whether a `VkDeviceCreateInfo` already enables the named extension.
+unsafe fn device_has_extension(p_ci: *const vk::DeviceCreateInfo, name: &CStr) -> bool {
+    let names = std::slice::from_raw_parts(
+        (*p_ci).pp_enabled_extension_names,
+        (*p_ci).enabled_extension_count as usize,
+    );
+    names
+        .iter()
+        .any(|&p| !p.is_null() && CStr::from_ptr(p).to_bytes() == name.to_bytes())
+}
+
+/// The first queue family index requested in a device create info.
+unsafe fn first_queue_family(p_ci: *const vk::DeviceCreateInfo) -> u32 {
+    if (*p_ci).queue_create_info_count == 0 || (*p_ci).p_queue_create_infos.is_null() {
+        return 0;
+    }
+    (*(*p_ci).p_queue_create_infos).queue_family_index
+}
+
+// ---------------------------------------------------------------------------
+// M4b: image identification
+// ---------------------------------------------------------------------------
+
+unsafe extern "system" fn create_image_view(
+    device: vk::Device,
+    p_create_info: *const vk::ImageViewCreateInfo,
+    p_allocator: *const vk::AllocationCallbacks,
+    p_view: *mut vk::ImageView,
+) -> vk::Result {
+    let map = DEVICES.read().unwrap();
+    let Some(d) = map.get(&device.as_raw()) else {
+        return vk::Result::ERROR_INITIALIZATION_FAILED;
+    };
+    match d.device.create_image_view(&*p_create_info, p_allocator.as_ref()) {
+        Ok(view) => {
+            *p_view = view;
+            VIEW_TO_IMAGE
+                .write()
+                .unwrap()
+                .insert(view.as_raw(), (*p_create_info).image.as_raw());
+            vk::Result::SUCCESS
+        }
+        Err(e) => e,
+    }
+}
+
+unsafe extern "system" fn destroy_image_view(
+    device: vk::Device,
+    view: vk::ImageView,
+    p_allocator: *const vk::AllocationCallbacks,
+) {
+    VIEW_TO_IMAGE.write().unwrap().remove(&view.as_raw());
+    if let Some(d) = DEVICES.read().unwrap().get(&device.as_raw()) {
+        d.device.destroy_image_view(view, p_allocator.as_ref());
+    }
+}
+
+unsafe extern "system" fn allocate_command_buffers(
+    device: vk::Device,
+    p_allocate_info: *const vk::CommandBufferAllocateInfo,
+    p_command_buffers: *mut vk::CommandBuffer,
+) -> vk::Result {
+    let map = DEVICES.read().unwrap();
+    let Some(d) = map.get(&device.as_raw()) else {
+        return vk::Result::ERROR_INITIALIZATION_FAILED;
+    };
+    match d.device.allocate_command_buffers(&*p_allocate_info) {
+        Ok(cbs) => {
+            let mut cb_map = CB_TO_DEVICE.write().unwrap();
+            for (i, cb) in cbs.iter().enumerate() {
+                *p_command_buffers.add(i) = *cb;
+                cb_map.insert(cb.as_raw(), device.as_raw());
+            }
+            vk::Result::SUCCESS
+        }
+        Err(e) => e,
+    }
+}
+
+unsafe extern "system" fn cmd_begin_rendering(
+    command_buffer: vk::CommandBuffer,
+    p_rendering_info: *const vk::RenderingInfo,
+) {
+    let device_raw = CB_TO_DEVICE.read().unwrap().get(&command_buffer.as_raw()).copied();
+    let Some(device_raw) = device_raw else {
+        return;
+    };
+    let map = DEVICES.read().unwrap();
+    let Some(d) = map.get(&device_raw) else {
+        return;
+    };
+
+    let desc = if p_rendering_info.is_null() {
+        None
+    } else {
+        matched_desc(device_raw, p_rendering_info)
+    };
+
+    if let Some(desc) = desc {
+        if d.vrs.is_some() && !*KILL {
+            let area = (*p_rendering_info).render_area;
+            if let Some((sr_view, texel)) = ensure_vrs_image(d, &desc, area) {
+                let info = &*p_rendering_info;
+                let mut attach = vk::RenderingFragmentShadingRateAttachmentInfoKHR::default()
+                    .image_view(sr_view)
+                    .image_layout(vk::ImageLayout::FRAGMENT_SHADING_RATE_ATTACHMENT_OPTIMAL_KHR)
+                    .shading_rate_attachment_texel_size(texel);
+                attach.p_next = info.p_next as *mut c_void;
+                let mut modified = *info;
+                modified.p_next =
+                    (&attach as *const vk::RenderingFragmentShadingRateAttachmentInfoKHR)
+                        .cast::<c_void>();
+                d.device.cmd_begin_rendering(command_buffer, &modified);
+                return;
+            }
+        }
+    }
+
+    d.device.cmd_begin_rendering(command_buffer, &*p_rendering_info);
+}
+
+/// The first OXR-tagged eye descriptor among this render's color attachments.
+unsafe fn matched_desc(
+    device_raw: u64,
+    p_info: *const vk::RenderingInfo,
+) -> Option<ffr_core::wire::FoveationDesc> {
+    let info = &*p_info;
+    if info.p_color_attachments.is_null() {
+        return None;
+    }
+    let attachments =
+        std::slice::from_raw_parts(info.p_color_attachments, info.color_attachment_count as usize);
+    for att in attachments {
+        if att.image_view.is_null() {
+            continue;
+        }
+        let image = VIEW_TO_IMAGE.read().unwrap().get(&att.image_view.as_raw()).copied();
+        let Some(image) = image else { continue };
+        let descs = ffr_registry::lookup(device_raw, image);
+        if let Some(d) = descs.first() {
+            if !LOGGED_RECOGNIZE.swap(true, Ordering::Relaxed) {
+                info!(
+                    "recognized eye image 0x{image:x}: eye {} {}x{} optical-center=({:.0},{:.0})",
+                    d.eye, d.rect_w, d.rect_h, d.center_px_x, d.center_px_y
+                );
+            }
+            return Some(*d);
+        }
+    }
+    None
+}
+
+/// Recreate graphics pipelines with a fragment-shading-rate state that REPLACEs
+/// the pipeline rate with the attachment rate, so they consume the SR map.
+unsafe extern "system" fn create_graphics_pipelines(
+    device: vk::Device,
+    pipeline_cache: vk::PipelineCache,
+    create_info_count: u32,
+    p_create_infos: *const vk::GraphicsPipelineCreateInfo,
+    p_allocator: *const vk::AllocationCallbacks,
+    p_pipelines: *mut vk::Pipeline,
+) -> vk::Result {
+    let map = DEVICES.read().unwrap();
+    let Some(d) = map.get(&device.as_raw()) else {
+        return vk::Result::ERROR_INITIALIZATION_FAILED;
+    };
+
+    let n = create_info_count as usize;
+    let infos = std::slice::from_raw_parts(p_create_infos, n);
+
+    let result = if d.vrs.is_some() && !*KILL {
+        // Reserve so the Vec never reallocates (we store pointers into it).
+        let mut fsr_states: Vec<vk::PipelineFragmentShadingRateStateCreateInfoKHR> =
+            Vec::with_capacity(n);
+        for info in infos {
+            let mut fsr = vk::PipelineFragmentShadingRateStateCreateInfoKHR::default()
+                .fragment_size(vk::Extent2D { width: 1, height: 1 })
+                .combiner_ops([
+                    vk::FragmentShadingRateCombinerOpKHR::KEEP,
+                    vk::FragmentShadingRateCombinerOpKHR::REPLACE,
+                ]);
+            fsr.p_next = info.p_next;
+            fsr_states.push(fsr);
+        }
+        let mut modified: Vec<vk::GraphicsPipelineCreateInfo> = Vec::with_capacity(n);
+        for (i, info) in infos.iter().enumerate() {
+            let mut mi = *info;
+            mi.p_next = (&fsr_states[i]
+                as *const vk::PipelineFragmentShadingRateStateCreateInfoKHR)
+                .cast::<c_void>();
+            modified.push(mi);
+        }
+        d.device
+            .create_graphics_pipelines(pipeline_cache, &modified, p_allocator.as_ref())
+    } else {
+        d.device
+            .create_graphics_pipelines(pipeline_cache, infos, p_allocator.as_ref())
+    };
+
+    match result {
+        Ok(pipes) => {
+            for (i, p) in pipes.iter().enumerate() {
+                *p_pipelines.add(i) = *p;
+            }
+            vk::Result::SUCCESS
+        }
+        Err((pipes, e)) => {
+            for (i, p) in pipes.iter().enumerate() {
+                *p_pipelines.add(i) = *p;
+            }
+            e
+        }
+    }
+}
+
+/// Ensure the eye's shading-rate image exists and matches its current
+/// foveation, returning its view + the attachment texel size.
+unsafe fn ensure_vrs_image(
+    d: &DeviceData,
+    desc: &ffr_core::wire::FoveationDesc,
+    area: vk::Rect2D,
+) -> Option<(vk::ImageView, vk::Extent2D)> {
+    let caps = d.vrs?;
+    let texel = caps.texel_size;
+    let area_w = area.extent.width;
+    let area_h = area.extent.height;
+    // Optical center relative to the render area origin.
+    let center_x = desc.center_px_x - area.offset.x as f32;
+    let center_y = desc.center_px_y - area.offset.y as f32;
+
+    let mut slot = d.vrs_images.lock().unwrap();
+    if let Some(img) = slot.get(&desc.eye) {
+        if img.matches(area_w, area_h, center_x, center_y, &desc.falloff) {
+            return Some((img.view, texel));
+        }
+        destroy_vrs_image(d, img);
+        slot.remove(&desc.eye);
+    }
+
+    let img = create_vrs_image(d, desc, area_w, area_h, center_x, center_y, texel)?;
+    let view = img.view;
+    slot.insert(desc.eye, img);
+    Some((view, texel))
+}
+
+#[allow(clippy::too_many_arguments)]
+unsafe fn create_vrs_image(
+    d: &DeviceData,
+    desc: &ffr_core::wire::FoveationDesc,
+    area_w: u32,
+    area_h: u32,
+    center_x: f32,
+    center_y: f32,
+    texel: vk::Extent2D,
+) -> Option<VrsImage> {
+    // Build the radial foveation map: full rate at the offset optical center,
+    // coarsening toward the edges. Radii are fractions of the half-extent.
+    let map = ffr_core::foveation::FoveationMap::generate(
+        area_w,
+        area_h,
+        (center_x, center_y),
+        texel.width.max(1),
+        (area_w as f32 / 2.0, area_h as f32 / 2.0),
+        &desc.falloff,
+    );
+
+    let dev = &d.device;
+    let image = dev
+        .create_image(
+            &vk::ImageCreateInfo::default()
+                .image_type(vk::ImageType::TYPE_2D)
+                .format(vk::Format::R8_UINT)
+                .extent(vk::Extent3D { width: map.cols, height: map.rows, depth: 1 })
+                .mip_levels(1)
+                .array_layers(1)
+                .samples(vk::SampleCountFlags::TYPE_1)
+                .tiling(vk::ImageTiling::OPTIMAL)
+                .usage(
+                    vk::ImageUsageFlags::FRAGMENT_SHADING_RATE_ATTACHMENT_KHR
+                        | vk::ImageUsageFlags::TRANSFER_DST,
+                )
+                .sharing_mode(vk::SharingMode::EXCLUSIVE),
+            None,
+        )
+        .ok()?;
+    let req = dev.get_image_memory_requirements(image);
+    let mem_type =
+        memory_type(&d.mem_props, req.memory_type_bits, vk::MemoryPropertyFlags::DEVICE_LOCAL);
+    let memory = dev
+        .allocate_memory(
+            &vk::MemoryAllocateInfo::default().allocation_size(req.size).memory_type_index(mem_type),
+            None,
+        )
+        .ok()?;
+    dev.bind_image_memory(image, memory, 0).ok()?;
+    let view = dev
+        .create_image_view(
+            &vk::ImageViewCreateInfo::default()
+                .image(image)
+                .view_type(vk::ImageViewType::TYPE_2D)
+                .format(vk::Format::R8_UINT)
+                .subresource_range(vk::ImageSubresourceRange {
+                    aspect_mask: vk::ImageAspectFlags::COLOR,
+                    base_mip_level: 0,
+                    level_count: 1,
+                    base_array_layer: 0,
+                    layer_count: 1,
+                }),
+            None,
+        )
+        .ok()?;
+
+    upload_map(d, image, &map)?;
+
+    if *DEBUG {
+        dump_foveation_ppm(desc.eye, &map);
+    }
+
+    if !LOGGED_INJECT.swap(true, Ordering::Relaxed) {
+        info!(
+            "built foveation map for eye {}: {}x{} tiles (texel {}x{}), \
+             center at tile ({},{}) — VRS active",
+            desc.eye,
+            map.cols,
+            map.rows,
+            texel.width,
+            texel.height,
+            (center_x / texel.width as f32) as u32,
+            (center_y / texel.height as f32) as u32,
+        );
+    }
+    Some(VrsImage {
+        image,
+        memory,
+        view,
+        area_w,
+        area_h,
+        center_x,
+        center_y,
+        falloff: desc.falloff,
+    })
+}
+
+/// Upload the foveation-map bytes into the `R8_UINT` image (staging buffer →
+/// copy) and transition it to `FRAGMENT_SHADING_RATE_ATTACHMENT_OPTIMAL`.
+unsafe fn upload_map(
+    d: &DeviceData,
+    image: vk::Image,
+    map: &ffr_core::foveation::FoveationMap,
+) -> Option<()> {
+    let dev = &d.device;
+    let size = map.bytes.len() as u64;
+
+    let staging = dev
+        .create_buffer(
+            &vk::BufferCreateInfo::default()
+                .size(size)
+                .usage(vk::BufferUsageFlags::TRANSFER_SRC)
+                .sharing_mode(vk::SharingMode::EXCLUSIVE),
+            None,
+        )
+        .ok()?;
+    let req = dev.get_buffer_memory_requirements(staging);
+    let mem = dev
+        .allocate_memory(
+            &vk::MemoryAllocateInfo::default().allocation_size(req.size).memory_type_index(
+                memory_type(
+                    &d.mem_props,
+                    req.memory_type_bits,
+                    vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
+                ),
+            ),
+            None,
+        )
+        .ok()?;
+    dev.bind_buffer_memory(staging, mem, 0).ok()?;
+    let ptr = dev.map_memory(mem, 0, req.size, vk::MemoryMapFlags::empty()).ok()?;
+    std::ptr::copy_nonoverlapping(map.bytes.as_ptr(), ptr as *mut u8, map.bytes.len());
+    dev.unmap_memory(mem);
+
+    let queue = dev.get_device_queue(d.queue_family, 0);
+    let pool = dev
+        .create_command_pool(
+            &vk::CommandPoolCreateInfo::default().queue_family_index(d.queue_family),
+            None,
+        )
+        .ok()?;
+    let cb = dev
+        .allocate_command_buffers(
+            &vk::CommandBufferAllocateInfo::default().command_pool(pool).command_buffer_count(1),
+        )
+        .ok()?[0];
+    dev.begin_command_buffer(
+        cb,
+        &vk::CommandBufferBeginInfo::default().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
+    )
+    .ok()?;
+
+    let range = vk::ImageSubresourceRange {
+        aspect_mask: vk::ImageAspectFlags::COLOR,
+        base_mip_level: 0,
+        level_count: 1,
+        base_array_layer: 0,
+        layer_count: 1,
+    };
+    barrier(dev, cb, image, range, vk::ImageLayout::UNDEFINED, vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+        vk::PipelineStageFlags::TOP_OF_PIPE, vk::PipelineStageFlags::TRANSFER,
+        vk::AccessFlags::empty(), vk::AccessFlags::TRANSFER_WRITE);
+    dev.cmd_copy_buffer_to_image(
+        cb,
+        staging,
+        image,
+        vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+        &[vk::BufferImageCopy::default()
+            .image_subresource(vk::ImageSubresourceLayers {
+                aspect_mask: vk::ImageAspectFlags::COLOR,
+                mip_level: 0,
+                base_array_layer: 0,
+                layer_count: 1,
+            })
+            .image_extent(vk::Extent3D { width: map.cols, height: map.rows, depth: 1 })],
+    );
+    barrier(dev, cb, image, range, vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+        vk::ImageLayout::FRAGMENT_SHADING_RATE_ATTACHMENT_OPTIMAL_KHR,
+        vk::PipelineStageFlags::TRANSFER, vk::PipelineStageFlags::FRAGMENT_SHADING_RATE_ATTACHMENT_KHR,
+        vk::AccessFlags::TRANSFER_WRITE, vk::AccessFlags::FRAGMENT_SHADING_RATE_ATTACHMENT_READ_KHR);
+    dev.end_command_buffer(cb).ok()?;
+
+    let cbs = [cb];
+    dev.queue_submit(queue, &[vk::SubmitInfo::default().command_buffers(&cbs)], vk::Fence::null())
+        .ok()?;
+    dev.queue_wait_idle(queue).ok()?;
+
+    dev.destroy_command_pool(pool, None);
+    dev.destroy_buffer(staging, None);
+    dev.free_memory(mem, None);
+    Some(())
+}
+
+#[allow(clippy::too_many_arguments)]
+unsafe fn barrier(
+    dev: &ash::Device,
+    cb: vk::CommandBuffer,
+    image: vk::Image,
+    range: vk::ImageSubresourceRange,
+    old: vk::ImageLayout,
+    new: vk::ImageLayout,
+    src_stage: vk::PipelineStageFlags,
+    dst_stage: vk::PipelineStageFlags,
+    src: vk::AccessFlags,
+    dst: vk::AccessFlags,
+) {
+    let b = vk::ImageMemoryBarrier::default()
+        .old_layout(old)
+        .new_layout(new)
+        .src_access_mask(src)
+        .dst_access_mask(dst)
+        .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+        .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+        .image(image)
+        .subresource_range(range);
+    dev.cmd_pipeline_barrier(cb, src_stage, dst_stage, vk::DependencyFlags::empty(), &[], &[], &[b]);
+}
+
+unsafe fn destroy_vrs_image(d: &DeviceData, img: &VrsImage) {
+    d.device.destroy_image_view(img.view, None);
+    d.device.destroy_image(img.image, None);
+    d.device.free_memory(img.memory, None);
+}
+
+/// Write the shading-rate map to a PPM image, false-colored by rate:
+/// green (1x1, full) → yellow (2x2) → red (4x4). Lets you *see* the foveation
+/// pattern and confirm it tracks the offset optical center.
+fn dump_foveation_ppm(eye: u32, map: &ffr_core::foveation::FoveationMap) {
+    let mut rgb = Vec::with_capacity(map.bytes.len() * 3);
+    for &b in &map.bytes {
+        let (r, g, bl) = match ShadingRate::decode(b).coverage() {
+            1 => (0u8, 255, 0),
+            2 => (160, 255, 0),
+            4 => (255, 255, 0),
+            8 => (255, 140, 0),
+            _ => (255, 0, 0),
+        };
+        rgb.extend_from_slice(&[r, g, bl]);
+    }
+    let dir = crate::logging::log_dir();
+    let _ = std::fs::create_dir_all(&dir);
+    let path = format!("{dir}/foveation-eye{eye}.ppm");
+    let mut data = format!("P6\n{} {}\n255\n", map.cols, map.rows).into_bytes();
+    data.extend_from_slice(&rgb);
+    if std::fs::write(&path, &data).is_ok() {
+        info!("wrote foveation debug image: {path}");
+    }
+}
+
+/// Pick a memory type index satisfying `props` from `req_bits`.
+fn memory_type(
+    mem_props: &vk::PhysicalDeviceMemoryProperties,
+    req_bits: u32,
+    props: vk::MemoryPropertyFlags,
+) -> u32 {
+    (0..mem_props.memory_type_count)
+        .find(|&i| {
+            (req_bits & (1 << i)) != 0
+                && mem_props.memory_types[i as usize].property_flags.contains(props)
+        })
+        .unwrap_or(0)
+}
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+/// Walk a `pNext` chain (every Vulkan struct starts with `{sType, pNext}`) to
+/// find the loader's instance dispatch-chain link.
+unsafe fn find_instance_chain_info(
+    p_ci: *const vk::InstanceCreateInfo,
+) -> *mut VkLayerInstanceCreateInfo {
+    let mut p = (*p_ci).p_next as *const VkLayerInstanceCreateInfo;
+    while !p.is_null() {
+        if (*p).s_type == VK_STRUCTURE_TYPE_LOADER_INSTANCE_CREATE_INFO
+            && (*p).function == VK_LAYER_LINK_INFO
+        {
+            return p as *mut VkLayerInstanceCreateInfo;
+        }
+        p = (*p).p_next as *const VkLayerInstanceCreateInfo;
+    }
+    ptr::null_mut()
+}
+
+unsafe fn find_device_chain_info(
+    p_ci: *const vk::DeviceCreateInfo,
+) -> *mut VkLayerDeviceCreateInfo {
+    let mut p = (*p_ci).p_next as *const VkLayerDeviceCreateInfo;
+    while !p.is_null() {
+        if (*p).s_type == VK_STRUCTURE_TYPE_LOADER_DEVICE_CREATE_INFO
+            && (*p).function == VK_LAYER_LINK_INFO
+        {
+            return p as *mut VkLayerDeviceCreateInfo;
+        }
+        p = (*p).p_next as *const VkLayerDeviceCreateInfo;
+    }
+    ptr::null_mut()
+}
+
+unsafe fn app_name(p_ci: *const vk::InstanceCreateInfo) -> String {
+    let app_info = (*p_ci).p_application_info;
+    if app_info.is_null() || (*app_info).p_application_name.is_null() {
+        return "<none>".to_string();
+    }
+    CStr::from_ptr((*app_info).p_application_name)
+        .to_string_lossy()
+        .into_owned()
+}
+
+unsafe fn app_api_version(p_ci: *const vk::InstanceCreateInfo) -> String {
+    let app_info = (*p_ci).p_application_info;
+    let v = if app_info.is_null() {
+        0
+    } else {
+        (*app_info).api_version
+    };
+    format!(
+        "{}.{}.{}",
+        vk::api_version_major(v),
+        vk::api_version_minor(v),
+        vk::api_version_patch(v)
+    )
+}
+
+unsafe fn gpu_name(instance_raw: Option<u64>, phys: vk::PhysicalDevice) -> String {
+    let Some(inst) = instance_raw else {
+        return "<unknown>".to_string();
+    };
+    let get_props = INSTANCES
+        .read()
+        .unwrap()
+        .get(&inst)
+        .map(|d| d.get_physical_device_properties);
+    let Some(get_props) = get_props else {
+        return "<unknown>".to_string();
+    };
+    let mut props = vk::PhysicalDeviceProperties::default();
+    get_props(phys, &mut props);
+    CStr::from_ptr(props.device_name.as_ptr())
+        .to_string_lossy()
+        .into_owned()
+}

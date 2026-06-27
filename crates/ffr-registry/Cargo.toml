@@ -1,0 +1,14 @@
+[package]
+name = "ffr-registry"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+# Stateless client that binds (via dlopen) to the single `libffr_shared.so`.
+# Both layers statically link THIS crate, but the registry STATE lives only in
+# the shared `.so`, so they observe the same data.
+
+[dependencies]
+ffr-core = { workspace = true }
+libloading = { workspace = true }

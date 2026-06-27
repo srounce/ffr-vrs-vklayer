@@ -1,0 +1,15 @@
+{
+  "file_format_version": "1.0.0",
+  "api_layer": {
+    "name": "XR_APILAYER_FFRVRS_foveation",
+    "library_path": "@library_path@",
+    "api_version": "1.0",
+    "implementation_version": "1",
+    "description": "Fixed Foveated Rendering (Vulkan VRS) injection layer",
+    "functions": {
+      "xrNegotiateLoaderApiLayerInterface": "xrNegotiateLoaderApiLayerInterface"
+    },
+    "enable_environment": "ENABLE_FFR_VRS_OXR",
+    "disable_environment": "DISABLE_FFR_VRS_OXR"
+  }
+}

@@ -1,0 +1,16 @@
+{
+  "file_format_version": "1.2.0",
+  "layer": {
+    "name": "VK_LAYER_FFR_VRS_foveation",
+    "type": "GLOBAL",
+    "library_path": "@library_path@",
+    "api_version": "1.4.304",
+    "implementation_version": "1",
+    "description": "Fixed Foveated Rendering via VK_KHR_fragment_shading_rate",
+    "functions": {
+      "vkNegotiateLoaderLayerInterfaceVersion": "vkNegotiateLoaderLayerInterfaceVersion"
+    },
+    "enable_environment": { "ENABLE_FFR_VRS": "1" },
+    "disable_environment": { "DISABLE_FFR_VRS": "1" }
+  }
+}

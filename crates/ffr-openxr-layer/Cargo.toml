@@ -1,0 +1,21 @@
+[package]
+name = "ffr-openxr-layer"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[lib]
+# Produces libXrApiLayer_FFR_VRS.so
+name = "XrApiLayer_FFR_VRS"
+crate-type = ["cdylib"]
+
+[dependencies]
+ffr-core = { workspace = true }
+ffr-registry = { workspace = true }
+openxr-sys = { workspace = true }
+libc = { workspace = true }
+once_cell = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+tracing-appender = { workspace = true }

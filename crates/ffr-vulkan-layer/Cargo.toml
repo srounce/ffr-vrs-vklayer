@@ -1,0 +1,22 @@
+[package]
+name = "ffr-vulkan-layer"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[lib]
+# Produces libVkLayer_FFR_VRS.so
+name = "VkLayer_FFR_VRS"
+crate-type = ["cdylib"]
+
+[dependencies]
+ffr-core = { workspace = true }
+ffr-registry = { workspace = true }
+ash = { workspace = true }
+libc = { workspace = true }
+once_cell = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+tracing-appender = { workspace = true }
+# vulkan_layer crate intentionally not used — dispatch is hand-rolled (see layer.rs).
