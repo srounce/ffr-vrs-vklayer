@@ -22,6 +22,18 @@ use tracing::{info, warn};
 use crate::vk_sys::*;
 
 const FSR_EXT_NAME: &CStr = c"VK_KHR_fragment_shading_rate";
+/// Device extensions `VK_KHR_fragment_shading_rate` depends on, with the core
+/// version each was promoted to. We must add any not-yet-core dependency to the
+/// enabled list when we enable FSR, or the loader/driver rejects the device (and
+/// our v1→v2 render-pass promotion calls a null `vkCreateRenderPass2`). The
+/// renderpass2 dependency is what Vulkan-1.0/1.1 apps (xrgears) are missing.
+const FSR_DEP_EXTS: &[(&CStr, u32)] = &[
+    (c"VK_KHR_create_renderpass2", VK_API_VERSION_1_2),
+    (c"VK_KHR_multiview", VK_API_VERSION_1_1),
+    (c"VK_KHR_maintenance2", VK_API_VERSION_1_1),
+];
+const VK_API_VERSION_1_1: u32 = vk::make_api_version(0, 1, 1, 0);
+const VK_API_VERSION_1_2: u32 = vk::make_api_version(0, 1, 2, 0);
 
 /// Kill switch: when `FFR_VRS_DISABLE` is set the layer stays in the call chain
 /// but injects nothing (for A/B comparison and emergency bypass).
@@ -47,6 +59,8 @@ struct InstanceData {
     get_physical_device_properties: vk::PFN_vkGetPhysicalDeviceProperties,
     /// ash wrapper over the down-chain instance functions (for VRS cap queries).
     instance: ash::Instance,
+    /// The API version the app requested (`VkApplicationInfo.apiVersion`, or 1.0).
+    app_api: u32,
 }
 
 /// Fragment-shading-rate capabilities resolved at device creation.
@@ -86,6 +100,11 @@ struct DeviceData {
     next_gdpa: PfnGetDeviceProcAddr,
     /// ash wrapper over the down-chain device functions (for our own GPU work).
     device: ash::Device,
+    /// `vkCreateRenderPass2` entry point, resolved under the right name for the
+    /// device's version: the core symbol on Vulkan ≥1.2, else the
+    /// `VK_KHR_create_renderpass2` alias `vkCreateRenderPass2KHR`. ash's wrapper
+    /// only knows the core symbol, which 1.0/1.1 devices don't expose.
+    create_rp2: Option<vk::PFN_vkCreateRenderPass2>,
     /// `Some` if attachment-based VRS is available + enabled on this device.
     vrs: Option<VrsCaps>,
     /// A graphics queue family the app created (for our one-shot init submits).
@@ -144,6 +163,8 @@ static LOGGED_LEGACY: AtomicBool = AtomicBool::new(false);
 #[derive(Clone, Copy)]
 struct LegacyRp {
     texel: vk::Extent2D,
+    /// Array layers the shading-rate attachment needs (1, or #views for multiview).
+    layers: u32,
 }
 static LEGACY_RP: Lazy<RwLock<HashMap<u64, LegacyRp>>> =
     Lazy::new(|| RwLock::new(HashMap::new()));
@@ -159,6 +180,8 @@ struct LegacyFb {
     rows: u32,
     area: vk::Extent2D,
     texel: vk::Extent2D,
+    /// Array layers (1, or #views for multiview — one foveation map per eye).
+    layers: u32,
     // The foveation the map was last filled from (refill only when it changes —
     // NOT every frame, since the descriptor generation bumps each frame).
     filled: bool,
@@ -320,6 +343,7 @@ unsafe extern "system" fn create_instance(
         enumerate_physical_devices: pfn(load(c"vkEnumeratePhysicalDevices")),
         get_physical_device_properties: pfn(load(c"vkGetPhysicalDeviceProperties")),
         instance: ash_instance,
+        app_api: app_api_version_raw(p_create_info),
     };
     INSTANCES.write().unwrap().insert(instance.as_raw(), data);
 
@@ -418,6 +442,7 @@ unsafe extern "system" fn create_device(
     let caps = instance_raw.and_then(|ir| query_vrs(ir, physical_device));
     let already_enabled = device_has_extension(p_create_info, FSR_EXT_NAME);
     let do_enable = caps.is_some() && !already_enabled;
+    let device_api = effective_device_api(instance_raw, physical_device);
 
     // Build a (possibly) modified create info that adds the extension + feature.
     // These locals must outlive the down-call below.
@@ -431,6 +456,15 @@ unsafe extern "system" fn create_device(
         );
         ext_ptrs.extend_from_slice(existing);
         ext_ptrs.push(FSR_EXT_NAME.as_ptr());
+        // Add any FSR dependency that is not yet core for this device's effective
+        // API version (min of the app's instance version and the GPU's), and that
+        // the app hasn't already enabled. Without this, sub-1.2 apps crash when we
+        // promote their render passes to renderpass2.
+        for (ext, core_since) in FSR_DEP_EXTS {
+            if device_api < *core_since && !device_has_extension(p_create_info, ext) {
+                ext_ptrs.push(ext.as_ptr());
+            }
+        }
         modified.pp_enabled_extension_names = ext_ptrs.as_ptr();
         modified.enabled_extension_count = ext_ptrs.len() as u32;
 
@@ -465,6 +499,17 @@ unsafe extern "system" fn create_device(
     });
     let ash_device = ash::Device::load(&inst_fn, device);
 
+    // Resolve vkCreateRenderPass2 under the name this device version exposes it:
+    // core on ≥1.2, else the KHR alias we enabled above.
+    let rp2_name = if device_api >= VK_API_VERSION_1_2 {
+        c"vkCreateRenderPass2"
+    } else {
+        c"vkCreateRenderPass2KHR"
+    };
+    let rp2_fp = next_gdpa(device, rp2_name.as_ptr());
+    let create_rp2: Option<vk::PFN_vkCreateRenderPass2> =
+        rp2_fp.map(|_| pfn::<vk::PFN_vkCreateRenderPass2>(rp2_fp));
+
     let mem_props = {
         let map = INSTANCES.read().unwrap();
         match instance_raw.and_then(|ir| map.get(&ir)) {
@@ -478,6 +523,7 @@ unsafe extern "system" fn create_device(
         DeviceData {
             next_gdpa,
             device: ash_device,
+            create_rp2,
             vrs: caps,
             queue_family,
             mem_props,
@@ -944,6 +990,22 @@ unsafe fn load_module(dev: &ash::Device, spv: &[u8]) -> Option<vk::ShaderModule>
 
 const FSR_LAYOUT: vk::ImageLayout = vk::ImageLayout::FRAGMENT_SHADING_RATE_ATTACHMENT_OPTIMAL_KHR;
 
+/// Call `vkCreateRenderPass2` via the entry point resolved for this device's
+/// version (core or KHR alias), falling back to ash's core wrapper if we somehow
+/// have no resolved pointer (only reachable on ≥1.2 devices).
+unsafe fn device_create_rp2(
+    d: &DeviceData,
+    ci: &vk::RenderPassCreateInfo2,
+    p_allocator: *const vk::AllocationCallbacks,
+) -> Result<vk::RenderPass, vk::Result> {
+    if let Some(f) = d.create_rp2 {
+        let mut rp = vk::RenderPass::null();
+        let r = f(d.device.handle(), ci, p_allocator, &mut rp);
+        return if r == vk::Result::SUCCESS { Ok(rp) } else { Err(r) };
+    }
+    d.device.create_render_pass2(ci, p_allocator.as_ref())
+}
+
 /// Augment a render pass with a fragment-shading-rate attachment so legacy
 /// (non-dynamic-rendering) apps get foveation. Returns the augmented handle to
 /// the app transparently.
@@ -958,19 +1020,17 @@ unsafe extern "system" fn create_render_pass2(
         return vk::Result::ERROR_INITIALIZATION_FAILED;
     };
     let ci = &*p_create_info;
-    let multiview = std::slice::from_raw_parts(ci.p_subpasses, ci.subpass_count as usize)
-        .iter()
-        .any(|s| s.view_mask != 0);
-    if multiview {
-        warn_multiview();
-    }
+    let layers = layers_from_masks(
+        std::slice::from_raw_parts(ci.p_subpasses, ci.subpass_count as usize)
+            .iter()
+            .map(|s| s.view_mask),
+    );
     let augment = d.vrs.is_some()
         && !*KILL
-        && !multiview
         && ci.attachment_count >= 1
         && has_color_subpass(ci);
     if !augment {
-        return match d.device.create_render_pass2(ci, p_allocator.as_ref()) {
+        return match device_create_rp2(d, ci, p_allocator) {
             Ok(rp) => {
                 *p_render_pass = rp;
                 vk::Result::SUCCESS
@@ -1027,13 +1087,15 @@ unsafe extern "system" fn create_render_pass2(
     aug.subpass_count = subs.len() as u32;
     aug.p_subpasses = subs.as_ptr();
 
-    let rp = match d.device.create_render_pass2(&aug, p_allocator.as_ref()) {
+    let rp = match device_create_rp2(d, &aug, p_allocator) {
         Ok(rp) => rp,
         Err(e) => return e,
     };
     *p_render_pass = rp;
-    LEGACY_RP.write().unwrap().insert(rp.as_raw(), LegacyRp { texel });
-    tracing::debug!("augmented legacy render pass (FSR attachment at index {fsr_index})");
+    LEGACY_RP.write().unwrap().insert(rp.as_raw(), LegacyRp { texel, layers });
+    tracing::debug!(
+        "augmented legacy render pass (FSR attachment at index {fsr_index}, {layers} layer(s))"
+    );
     vk::Result::SUCCESS
 }
 
@@ -1078,7 +1140,7 @@ unsafe extern "system" fn create_framebuffer(
     let color_image = VIEW_TO_IMAGE.read().unwrap().get(&color_view.as_raw()).copied().unwrap_or(0);
     let cols = ci.width.div_ceil(rp.texel.width.max(1));
     let rows = ci.height.div_ceil(rp.texel.height.max(1));
-    let Some((sr_image, sr_memory, sr_view)) = alloc_sr_image(d, cols, rows) else {
+    let Some((sr_image, sr_memory, sr_view)) = alloc_sr_image(d, cols, rows, rp.layers) else {
         return passthrough();
     };
 
@@ -1108,6 +1170,7 @@ unsafe extern "system" fn create_framebuffer(
             rows,
             area: vk::Extent2D { width: ci.width, height: ci.height },
             texel: rp.texel,
+            layers: rp.layers,
             filled: false,
             fill_center_x: 0.0,
             fill_center_y: 0.0,
@@ -1158,10 +1221,11 @@ unsafe fn ensure_legacy_fill(d: &DeviceData, device_raw: u64, fb_raw: u64) {
     let Some(fb) = fbs.get_mut(&fb_raw) else {
         return;
     };
-    let best = ffr_registry::lookup(device_raw, fb.color_image)
-        .into_iter()
-        .max_by_key(|x| x.generation);
+    let descs = ffr_registry::lookup(device_raw, fb.color_image);
+    let best = descs.iter().copied().max_by_key(|x| x.generation);
     // No-descriptor uses a sentinel center (-1) so a real one always differs.
+    // Change detection keys on the freshest descriptor: in multiview both eyes'
+    // descriptors bump generation together, so they refill in lockstep.
     let (cx, cy, falloff) = match &best {
         Some(d) => (d.center_px_x, d.center_px_y, d.falloff),
         None => (-1.0, -1.0, ffr_core::wire::FalloffParams::default()),
@@ -1173,23 +1237,40 @@ unsafe fn ensure_legacy_fill(d: &DeviceData, device_raw: u64, fb_raw: u64) {
     {
         return;
     }
-    let map = match &best {
-        Some(desc) => ffr_core::foveation::FoveationMap::generate(
-            fb.area.width,
-            fb.area.height,
-            (desc.center_px_x, desc.center_px_y),
-            fb.texel.width.max(1),
-            (fb.area.width as f32 / 2.0, fb.area.height as f32 / 2.0),
-            &desc.falloff,
-        ),
-        None => ffr_core::foveation::FoveationMap {
-            cols: fb.cols,
-            rows: fb.rows,
-            texel_size: fb.texel.width,
-            bytes: vec![0u8; (fb.cols * fb.rows) as usize],
-        },
-    };
-    if upload_map(d, fb.sr_image, &map).is_some() {
+
+    // Read the Copy fields we need before the per-layer upload loop borrows `d`.
+    let (layers, area, texel, cols, rows) =
+        (fb.layers, fb.area, fb.texel, fb.cols, fb.rows);
+    let mut all_ok = true;
+    for layer in 0..layers {
+        // Per-view: the descriptor whose array index matches this layer; fall
+        // back to the freshest one (e.g. single-descriptor double-wide images).
+        let chosen = descs
+            .iter()
+            .find(|x| x.image_array_index == layer)
+            .copied()
+            .or(best);
+        let map = match &chosen {
+            Some(desc) => ffr_core::foveation::FoveationMap::generate(
+                area.width,
+                area.height,
+                (desc.center_px_x, desc.center_px_y),
+                texel.width.max(1),
+                (area.width as f32 / 2.0, area.height as f32 / 2.0),
+                &desc.falloff,
+            ),
+            None => ffr_core::foveation::FoveationMap {
+                cols,
+                rows,
+                texel_size: texel.width,
+                bytes: vec![0u8; (cols * rows) as usize],
+            },
+        };
+        if upload_map(d, fb.sr_image, &map, layer).is_none() {
+            all_ok = false;
+        }
+    }
+    if all_ok {
         fb.filled = true;
         fb.fill_center_x = cx;
         fb.fill_center_y = cy;
@@ -1197,8 +1278,8 @@ unsafe fn ensure_legacy_fill(d: &DeviceData, device_raw: u64, fb_raw: u64) {
         if best.is_some() && !LOGGED_LEGACY.swap(true, Ordering::Relaxed) {
             info!(
                 "legacy render-pass VRS active: filled shading-rate map for eye image \
-                 0x{:x} ({}x{} tiles)",
-                fb.color_image, fb.cols, fb.rows
+                 0x{:x} ({}x{} tiles, {} layer(s))",
+                fb.color_image, fb.cols, fb.rows, layers
             );
         }
     }
@@ -1218,6 +1299,7 @@ unsafe fn alloc_sr_image(
     d: &DeviceData,
     cols: u32,
     rows: u32,
+    layers: u32,
 ) -> Option<(vk::Image, vk::DeviceMemory, vk::ImageView)> {
     let dev = &d.device;
     let image = dev
@@ -1227,7 +1309,7 @@ unsafe fn alloc_sr_image(
                 .format(vk::Format::R8_UINT)
                 .extent(vk::Extent3D { width: cols, height: rows, depth: 1 })
                 .mip_levels(1)
-                .array_layers(1)
+                .array_layers(layers)
                 .samples(vk::SampleCountFlags::TYPE_1)
                 .tiling(vk::ImageTiling::OPTIMAL)
                 .usage(
@@ -1248,18 +1330,23 @@ unsafe fn alloc_sr_image(
         )
         .ok()?;
     dev.bind_image_memory(image, memory, 0).ok()?;
+    let view_type = if layers > 1 {
+        vk::ImageViewType::TYPE_2D_ARRAY
+    } else {
+        vk::ImageViewType::TYPE_2D
+    };
     let view = dev
         .create_image_view(
             &vk::ImageViewCreateInfo::default()
                 .image(image)
-                .view_type(vk::ImageViewType::TYPE_2D)
+                .view_type(view_type)
                 .format(vk::Format::R8_UINT)
                 .subresource_range(vk::ImageSubresourceRange {
                     aspect_mask: vk::ImageAspectFlags::COLOR,
                     base_mip_level: 0,
                     level_count: 1,
                     base_array_layer: 0,
-                    layer_count: 1,
+                    layer_count: layers,
                 }),
             None,
         )
@@ -1267,10 +1354,55 @@ unsafe fn alloc_sr_image(
     Some((image, memory, view))
 }
 
-static LOGGED_MULTIVIEW: AtomicBool = AtomicBool::new(false);
-fn warn_multiview() {
-    if !LOGGED_MULTIVIEW.swap(true, Ordering::Relaxed) {
-        warn!("multiview render pass detected — VRS injection not yet supported there (M8), passing through");
+/// Number of array layers a shading-rate attachment needs to cover all views in
+/// a multiview render pass: the highest set view-mask bit + 1 (1 if no multiview).
+fn layers_from_masks(masks: impl Iterator<Item = u32>) -> u32 {
+    let mut layers = 1u32;
+    for m in masks {
+        if m != 0 {
+            layers = layers.max(32 - m.leading_zeros());
+        }
+    }
+    layers
+}
+
+/// The per-subpass view masks, dependency view offsets, and correlation masks of
+/// a v1 render pass that opts into multiview via `VkRenderPassMultiviewCreateInfo`.
+/// Returned as owned vectors so they outlive the borrowed create-info chain.
+struct MultiviewV1 {
+    view_masks: Vec<u32>,
+    view_offsets: Vec<i32>,
+    correlation_masks: Vec<u32>,
+}
+
+unsafe fn find_multiview_v1(ci: &vk::RenderPassCreateInfo) -> Option<MultiviewV1> {
+    let mut next = ci.p_next;
+    while !next.is_null() {
+        let base = next as *const vk::BaseInStructure;
+        if (*base).s_type == vk::StructureType::RENDER_PASS_MULTIVIEW_CREATE_INFO {
+            let mv = &*(next as *const vk::RenderPassMultiviewCreateInfo);
+            let masks = slice_or_empty(mv.p_view_masks, mv.subpass_count);
+            if !masks.iter().any(|&m| m != 0) {
+                return None; // present but inert
+            }
+            return Some(MultiviewV1 {
+                view_masks: masks.to_vec(),
+                view_offsets: slice_or_empty(mv.p_view_offsets, mv.dependency_count).to_vec(),
+                correlation_masks: slice_or_empty(mv.p_correlation_masks, mv.correlation_mask_count)
+                    .to_vec(),
+            });
+        }
+        next = (*base).p_next as *const c_void;
+    }
+    None
+}
+
+/// Slice from a pointer/count, treating a null pointer as empty.
+unsafe fn slice_or_empty<'a, T>(ptr: *const T, count: u32) -> &'a [T] {
+    if ptr.is_null() || count == 0 {
+        &[]
+    } else {
+        std::slice::from_raw_parts(ptr, count as usize)
     }
 }
 
@@ -1305,13 +1437,10 @@ unsafe extern "system" fn create_render_pass(
     let ci = &*p_create_info;
     let v1_atts = std::slice::from_raw_parts(ci.p_attachments, ci.attachment_count as usize);
     let v1_subs = std::slice::from_raw_parts(ci.p_subpasses, ci.subpass_count as usize);
-    let multiview = render_pass_v1_is_multiview(ci);
-    if multiview {
-        warn_multiview();
-    }
+    let mv = find_multiview_v1(ci);
+    let layers = layers_from_masks(mv.iter().flat_map(|m| m.view_masks.iter().copied()));
     let augment = d.vrs.is_some()
         && !*KILL
-        && !multiview
         && ci.attachment_count >= 1
         && v1_subs.iter().any(|s| s.color_attachment_count > 0);
     if !augment {
@@ -1422,10 +1551,11 @@ unsafe extern "system" fn create_render_pass(
     }
     let mut subs2: Vec<vk::SubpassDescription2> = Vec::with_capacity(n);
     for (i, sub) in v1_subs.iter().enumerate() {
+        let view_mask = mv.as_ref().and_then(|m| m.view_masks.get(i).copied()).unwrap_or(0);
         let mut s = vk::SubpassDescription2::default()
             .flags(sub.flags)
             .pipeline_bind_point(sub.pipeline_bind_point)
-            .view_mask(0)
+            .view_mask(view_mask)
             .input_attachments(&input_refs[i])
             .color_attachments(&color_refs[i]);
         if !resolve_refs[i].is_empty() {
@@ -1447,7 +1577,12 @@ unsafe extern "system" fn create_render_pass(
         std::slice::from_raw_parts(ci.p_dependencies, ci.dependency_count as usize);
     let deps2: Vec<vk::SubpassDependency2> = v1_deps
         .iter()
-        .map(|dep| {
+        .enumerate()
+        .map(|(i, dep)| {
+            // Multiview view offsets travel as a parallel array on the multiview
+            // struct (one per dependency), not on the v1 dependency itself.
+            let view_offset =
+                mv.as_ref().and_then(|m| m.view_offsets.get(i).copied()).unwrap_or(0);
             vk::SubpassDependency2::default()
                 .src_subpass(dep.src_subpass)
                 .dst_subpass(dep.dst_subpass)
@@ -1456,7 +1591,7 @@ unsafe extern "system" fn create_render_pass(
                 .src_access_mask(dep.src_access_mask)
                 .dst_access_mask(dep.dst_access_mask)
                 .dependency_flags(dep.dependency_flags)
-                .view_offset(0)
+                .view_offset(view_offset)
         })
         .collect();
 
@@ -1464,14 +1599,17 @@ unsafe extern "system" fn create_render_pass(
         .attachments(&atts2)
         .subpasses(&subs2)
         .dependencies(&deps2);
+    if let Some(m) = &mv {
+        info2 = info2.correlated_view_masks(&m.correlation_masks);
+    }
     info2.flags = ci.flags;
-    let rp = match d.device.create_render_pass2(&info2, p_allocator.as_ref()) {
+    let rp = match device_create_rp2(d, &info2, p_allocator) {
         Ok(rp) => rp,
         Err(e) => return e,
     };
     *p_render_pass = rp;
-    LEGACY_RP.write().unwrap().insert(rp.as_raw(), LegacyRp { texel });
-    tracing::debug!("promoted + augmented legacy v1 render pass");
+    LEGACY_RP.write().unwrap().insert(rp.as_raw(), LegacyRp { texel, layers });
+    tracing::debug!("promoted + augmented legacy v1 render pass ({layers} layer(s))");
     vk::Result::SUCCESS
 }
 
@@ -1490,24 +1628,6 @@ unsafe extern "system" fn cmd_begin_render_pass(
     };
     ensure_legacy_fill(d, device_raw, (*p_render_pass_begin).framebuffer.as_raw());
     d.device.cmd_begin_render_pass(command_buffer, &*p_render_pass_begin, contents);
-}
-
-/// Whether a v1 render pass uses multiview (via `VkRenderPassMultiviewCreateInfo`).
-unsafe fn render_pass_v1_is_multiview(ci: &vk::RenderPassCreateInfo) -> bool {
-    let mut next = ci.p_next;
-    while !next.is_null() {
-        let base = next as *const vk::BaseInStructure;
-        if (*base).s_type == vk::StructureType::RENDER_PASS_MULTIVIEW_CREATE_INFO {
-            let mv = next as *const vk::RenderPassMultiviewCreateInfo;
-            let masks = std::slice::from_raw_parts(
-                (*mv).p_view_masks,
-                (*mv).subpass_count as usize,
-            );
-            return masks.iter().any(|&m| m != 0);
-        }
-        next = (*base).p_next as *const c_void;
-    }
-    false
 }
 
 /// Recreate graphics pipelines with a fragment-shading-rate state that REPLACEs
@@ -1670,7 +1790,7 @@ unsafe fn create_vrs_image(
         )
         .ok()?;
 
-    upload_map(d, image, &map)?;
+    upload_map(d, image, &map, 0)?;
 
     if *DEBUG {
         dump_foveation_ppm(desc.eye, &map);
@@ -1707,6 +1827,7 @@ unsafe fn upload_map(
     d: &DeviceData,
     image: vk::Image,
     map: &ffr_core::foveation::FoveationMap,
+    base_layer: u32,
 ) -> Option<()> {
     let dev = &d.device;
     let size = map.bytes.len() as u64;
@@ -1760,7 +1881,7 @@ unsafe fn upload_map(
         aspect_mask: vk::ImageAspectFlags::COLOR,
         base_mip_level: 0,
         level_count: 1,
-        base_array_layer: 0,
+        base_array_layer: base_layer,
         layer_count: 1,
     };
     barrier(dev, cb, image, range, vk::ImageLayout::UNDEFINED, vk::ImageLayout::TRANSFER_DST_OPTIMAL,
@@ -1775,7 +1896,7 @@ unsafe fn upload_map(
             .image_subresource(vk::ImageSubresourceLayers {
                 aspect_mask: vk::ImageAspectFlags::COLOR,
                 mip_level: 0,
-                base_array_layer: 0,
+                base_array_layer: base_layer,
                 layer_count: 1,
             })
             .image_extent(vk::Extent3D { width: map.cols, height: map.rows, depth: 1 })],
@@ -1913,6 +2034,18 @@ unsafe fn app_name(p_ci: *const vk::InstanceCreateInfo) -> String {
         .into_owned()
 }
 
+/// The raw `VkApplicationInfo.apiVersion`, or 1.0 if the app supplied none
+/// (per spec, a zero/absent app api version means Vulkan 1.0).
+unsafe fn app_api_version_raw(p_ci: *const vk::InstanceCreateInfo) -> u32 {
+    let app_info = (*p_ci).p_application_info;
+    let v = if app_info.is_null() { 0 } else { (*app_info).api_version };
+    if v == 0 {
+        vk::make_api_version(0, 1, 0, 0)
+    } else {
+        v
+    }
+}
+
 unsafe fn app_api_version(p_ci: *const vk::InstanceCreateInfo) -> String {
     let app_info = (*p_ci).p_application_info;
     let v = if app_info.is_null() {
@@ -1926,6 +2059,18 @@ unsafe fn app_api_version(p_ci: *const vk::InstanceCreateInfo) -> String {
         vk::api_version_minor(v),
         vk::api_version_patch(v)
     )
+}
+
+/// The effective device API version — `min(app instance version, GPU version)`.
+/// Extension-dependency rules (e.g. "FSR needs renderpass2 unless core ≥1.2")
+/// are evaluated against this, matching how the loader/validation judge them.
+unsafe fn effective_device_api(instance_raw: Option<u64>, phys: vk::PhysicalDevice) -> u32 {
+    let map = INSTANCES.read().unwrap();
+    let Some(inst) = instance_raw.and_then(|ir| map.get(&ir)) else {
+        return vk::make_api_version(0, 1, 0, 0);
+    };
+    let props = inst.instance.get_physical_device_properties(phys);
+    inst.app_api.min(props.api_version)
 }
 
 unsafe fn gpu_name(instance_raw: Option<u64>, phys: vk::PhysicalDevice) -> String {

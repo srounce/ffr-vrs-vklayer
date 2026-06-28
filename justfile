@@ -63,6 +63,21 @@ debug-loaders *ARGS:
     export XRT_LOG=debug
     cargo run -p ffr-test-app -- {{ ARGS }}
 
+# Multiview (M8) check. Two passes, no headset needed:
+#   * self-augment under the Khronos validation layer — proves the augmented
+#     multiview renderpass2 + layered shading-rate attachment is spec-valid.
+#   * layer mode — the real FFR layer injects on the live driver.
+mv-check:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    out="$(nix build .#layers --no-link --print-out-paths)"
+    export XDG_DATA_DIRS="$out/share:${XDG_DATA_DIRS:-/usr/local/share:/usr/share}"
+    cargo build -p ffr-test-app --bin mv_check
+    echo "== self-augment (validation layer) =="
+    MV_CHECK_SELF_AUGMENT=1 cargo run -q -p ffr-test-app --bin mv_check
+    echo "== layer mode (FFR injects on the driver) =="
+    cargo run -q -p ffr-test-app --bin mv_check
+
 # Smoke test: the implicit Vulkan layer is discovered via XDG_DATA_DIRS and
 # enabled by ENABLE_FFR_VRS=1, so vulkaninfo should load and list it.
 smoke:
