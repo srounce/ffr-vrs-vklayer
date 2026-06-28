@@ -137,6 +137,37 @@ static CB_RENDER: Lazy<RwLock<HashMap<u64, RenderState>>> =
 static LOGGED_RECOGNIZE: AtomicBool = AtomicBool::new(false);
 static LOGGED_INJECT: AtomicBool = AtomicBool::new(false);
 static LOGGED_OVERLAY: AtomicBool = AtomicBool::new(false);
+static LOGGED_LEGACY: AtomicBool = AtomicBool::new(false);
+
+/// A render pass we augmented with a fragment-shading-rate attachment (legacy
+/// / non-dynamic-rendering path), keyed by the returned `VkRenderPass`.
+#[derive(Clone, Copy)]
+struct LegacyRp {
+    texel: vk::Extent2D,
+}
+static LEGACY_RP: Lazy<RwLock<HashMap<u64, LegacyRp>>> =
+    Lazy::new(|| RwLock::new(HashMap::new()));
+
+/// A framebuffer of an augmented render pass: carries its own shading-rate
+/// image (filled lazily at begin-render-pass from the eye image's descriptor).
+struct LegacyFb {
+    color_image: u64,
+    sr_image: vk::Image,
+    sr_memory: vk::DeviceMemory,
+    sr_view: vk::ImageView,
+    cols: u32,
+    rows: u32,
+    area: vk::Extent2D,
+    texel: vk::Extent2D,
+    // The foveation the map was last filled from (refill only when it changes —
+    // NOT every frame, since the descriptor generation bumps each frame).
+    filled: bool,
+    fill_center_x: f32,
+    fill_center_y: f32,
+    fill_falloff: ffr_core::wire::FalloffParams,
+}
+static LEGACY_FB: Lazy<Mutex<HashMap<u64, LegacyFb>>> =
+    Lazy::new(|| Mutex::new(HashMap::new()));
 
 /// Cast a layer entry-point fn item into the loader's `PFN_vkVoidFunction`.
 macro_rules! vk_fn {
@@ -230,6 +261,11 @@ pub unsafe extern "system" fn get_device_proc_addr(
         b"vkCmdBeginRendering" => return vk_fn!(cmd_begin_rendering),
         b"vkCmdEndRendering" => return vk_fn!(cmd_end_rendering),
         b"vkCreateGraphicsPipelines" => return vk_fn!(create_graphics_pipelines),
+        b"vkCreateRenderPass2" => return vk_fn!(create_render_pass2),
+        b"vkDestroyRenderPass" => return vk_fn!(destroy_render_pass),
+        b"vkCreateFramebuffer" => return vk_fn!(create_framebuffer),
+        b"vkDestroyFramebuffer" => return vk_fn!(destroy_framebuffer),
+        b"vkCmdBeginRenderPass2" => return vk_fn!(cmd_begin_render_pass2),
         _ => {}
     }
     let next = DEVICES.read().unwrap().get(&device.as_raw()).map(|d| d.next_gdpa);
@@ -898,6 +934,326 @@ unsafe fn build_overlay_pipeline(
 unsafe fn load_module(dev: &ash::Device, spv: &[u8]) -> Option<vk::ShaderModule> {
     let code = ash::util::read_spv(&mut std::io::Cursor::new(spv)).ok()?;
     dev.create_shader_module(&vk::ShaderModuleCreateInfo::default().code(&code), None).ok()
+}
+
+// ---------------------------------------------------------------------------
+// M7: legacy render-pass injection (classic VkRenderPass, non-multiview)
+// ---------------------------------------------------------------------------
+
+const FSR_LAYOUT: vk::ImageLayout = vk::ImageLayout::FRAGMENT_SHADING_RATE_ATTACHMENT_OPTIMAL_KHR;
+
+/// Augment a render pass with a fragment-shading-rate attachment so legacy
+/// (non-dynamic-rendering) apps get foveation. Returns the augmented handle to
+/// the app transparently.
+unsafe extern "system" fn create_render_pass2(
+    device: vk::Device,
+    p_create_info: *const vk::RenderPassCreateInfo2,
+    p_allocator: *const vk::AllocationCallbacks,
+    p_render_pass: *mut vk::RenderPass,
+) -> vk::Result {
+    let map = DEVICES.read().unwrap();
+    let Some(d) = map.get(&device.as_raw()) else {
+        return vk::Result::ERROR_INITIALIZATION_FAILED;
+    };
+    let ci = &*p_create_info;
+    let augment =
+        d.vrs.is_some() && !*KILL && ci.attachment_count >= 1 && has_color_subpass(ci);
+    if !augment {
+        return match d.device.create_render_pass2(ci, p_allocator.as_ref()) {
+            Ok(rp) => {
+                *p_render_pass = rp;
+                vk::Result::SUCCESS
+            }
+            Err(e) => e,
+        };
+    }
+
+    let texel = d.vrs.unwrap().texel_size;
+    let fsr_index = ci.attachment_count;
+    let orig_atts = std::slice::from_raw_parts(ci.p_attachments, ci.attachment_count as usize);
+    let mut atts: Vec<vk::AttachmentDescription2> = orig_atts.to_vec();
+    atts.push(
+        vk::AttachmentDescription2::default()
+            .format(vk::Format::R8_UINT)
+            .samples(vk::SampleCountFlags::TYPE_1)
+            .load_op(vk::AttachmentLoadOp::LOAD)
+            .store_op(vk::AttachmentStoreOp::DONT_CARE)
+            .stencil_load_op(vk::AttachmentLoadOp::DONT_CARE)
+            .stencil_store_op(vk::AttachmentStoreOp::DONT_CARE)
+            .initial_layout(FSR_LAYOUT)
+            .final_layout(FSR_LAYOUT),
+    );
+
+    let orig_subs = std::slice::from_raw_parts(ci.p_subpasses, ci.subpass_count as usize);
+    let n = orig_subs.len();
+    let mut fsr_refs: Vec<vk::AttachmentReference2> = Vec::with_capacity(n);
+    for _ in 0..n {
+        fsr_refs.push(
+            vk::AttachmentReference2::default()
+                .attachment(fsr_index)
+                .layout(FSR_LAYOUT)
+                .aspect_mask(vk::ImageAspectFlags::COLOR),
+        );
+    }
+    let mut fsr_infos: Vec<vk::FragmentShadingRateAttachmentInfoKHR> = Vec::with_capacity(n);
+    for (i, sub) in orig_subs.iter().enumerate() {
+        let mut info = vk::FragmentShadingRateAttachmentInfoKHR::default()
+            .shading_rate_attachment_texel_size(texel);
+        info.p_fragment_shading_rate_attachment = &fsr_refs[i];
+        info.p_next = sub.p_next; // prepend ours before any existing chain
+        fsr_infos.push(info);
+    }
+    let mut subs: Vec<vk::SubpassDescription2> = Vec::with_capacity(n);
+    for (i, sub) in orig_subs.iter().enumerate() {
+        let mut s = *sub;
+        s.p_next = (&fsr_infos[i] as *const vk::FragmentShadingRateAttachmentInfoKHR).cast();
+        subs.push(s);
+    }
+
+    let mut aug = *ci;
+    aug.attachment_count = atts.len() as u32;
+    aug.p_attachments = atts.as_ptr();
+    aug.subpass_count = subs.len() as u32;
+    aug.p_subpasses = subs.as_ptr();
+
+    let rp = match d.device.create_render_pass2(&aug, p_allocator.as_ref()) {
+        Ok(rp) => rp,
+        Err(e) => return e,
+    };
+    *p_render_pass = rp;
+    LEGACY_RP.write().unwrap().insert(rp.as_raw(), LegacyRp { texel });
+    tracing::debug!("augmented legacy render pass (FSR attachment at index {fsr_index})");
+    vk::Result::SUCCESS
+}
+
+unsafe extern "system" fn destroy_render_pass(
+    device: vk::Device,
+    render_pass: vk::RenderPass,
+    p_allocator: *const vk::AllocationCallbacks,
+) {
+    LEGACY_RP.write().unwrap().remove(&render_pass.as_raw());
+    if let Some(d) = DEVICES.read().unwrap().get(&device.as_raw()) {
+        d.device.destroy_render_pass(render_pass, p_allocator.as_ref());
+    }
+}
+
+unsafe extern "system" fn create_framebuffer(
+    device: vk::Device,
+    p_create_info: *const vk::FramebufferCreateInfo,
+    p_allocator: *const vk::AllocationCallbacks,
+    p_framebuffer: *mut vk::Framebuffer,
+) -> vk::Result {
+    let map = DEVICES.read().unwrap();
+    let Some(d) = map.get(&device.as_raw()) else {
+        return vk::Result::ERROR_INITIALIZATION_FAILED;
+    };
+    let ci = &*p_create_info;
+    let passthrough = || match d.device.create_framebuffer(ci, p_allocator.as_ref()) {
+        Ok(fb) => {
+            *p_framebuffer = fb;
+            vk::Result::SUCCESS
+        }
+        Err(e) => e,
+    };
+
+    let rp = LEGACY_RP.read().unwrap().get(&ci.render_pass.as_raw()).copied();
+    let Some(rp) = rp else { return passthrough() };
+    if ci.flags.contains(vk::FramebufferCreateFlags::IMAGELESS) {
+        return passthrough(); // imageless framebuffers unsupported here
+    }
+
+    let atts = std::slice::from_raw_parts(ci.p_attachments, ci.attachment_count as usize);
+    let color_view = atts.first().copied().unwrap_or(vk::ImageView::null());
+    let color_image = VIEW_TO_IMAGE.read().unwrap().get(&color_view.as_raw()).copied().unwrap_or(0);
+    let cols = ci.width.div_ceil(rp.texel.width.max(1));
+    let rows = ci.height.div_ceil(rp.texel.height.max(1));
+    let Some((sr_image, sr_memory, sr_view)) = alloc_sr_image(d, cols, rows) else {
+        return passthrough();
+    };
+
+    let mut aug_atts: Vec<vk::ImageView> = atts.to_vec();
+    aug_atts.push(sr_view);
+    let mut aug = *ci;
+    aug.attachment_count = aug_atts.len() as u32;
+    aug.p_attachments = aug_atts.as_ptr();
+    let fb = match d.device.create_framebuffer(&aug, p_allocator.as_ref()) {
+        Ok(fb) => fb,
+        Err(e) => {
+            d.device.destroy_image_view(sr_view, None);
+            d.device.destroy_image(sr_image, None);
+            d.device.free_memory(sr_memory, None);
+            return e;
+        }
+    };
+    *p_framebuffer = fb;
+    LEGACY_FB.lock().unwrap().insert(
+        fb.as_raw(),
+        LegacyFb {
+            color_image,
+            sr_image,
+            sr_memory,
+            sr_view,
+            cols,
+            rows,
+            area: vk::Extent2D { width: ci.width, height: ci.height },
+            texel: rp.texel,
+            filled: false,
+            fill_center_x: 0.0,
+            fill_center_y: 0.0,
+            fill_falloff: ffr_core::wire::FalloffParams::default(),
+        },
+    );
+    vk::Result::SUCCESS
+}
+
+unsafe extern "system" fn destroy_framebuffer(
+    device: vk::Device,
+    framebuffer: vk::Framebuffer,
+    p_allocator: *const vk::AllocationCallbacks,
+) {
+    let fb = LEGACY_FB.lock().unwrap().remove(&framebuffer.as_raw());
+    if let Some(d) = DEVICES.read().unwrap().get(&device.as_raw()) {
+        if let Some(fb) = fb {
+            d.device.destroy_image_view(fb.sr_view, None);
+            d.device.destroy_image(fb.sr_image, None);
+            d.device.free_memory(fb.sr_memory, None);
+        }
+        d.device.destroy_framebuffer(framebuffer, p_allocator.as_ref());
+    }
+}
+
+unsafe extern "system" fn cmd_begin_render_pass2(
+    command_buffer: vk::CommandBuffer,
+    p_render_pass_begin: *const vk::RenderPassBeginInfo,
+    p_subpass_begin_info: *const vk::SubpassBeginInfo,
+) {
+    let device_raw = CB_TO_DEVICE.read().unwrap().get(&command_buffer.as_raw()).copied();
+    let Some(device_raw) = device_raw else {
+        return;
+    };
+    let map = DEVICES.read().unwrap();
+    let Some(d) = map.get(&device_raw) else {
+        return;
+    };
+    let fb_raw = (*p_render_pass_begin).framebuffer.as_raw();
+    ensure_legacy_fill(d, device_raw, fb_raw);
+    d.device.cmd_begin_render_pass2(command_buffer, &*p_render_pass_begin, &*p_subpass_begin_info);
+}
+
+/// Fill an augmented framebuffer's shading-rate image from the eye image's
+/// latest descriptor (or a uniform 1x1 if none yet). One-time per generation.
+unsafe fn ensure_legacy_fill(d: &DeviceData, device_raw: u64, fb_raw: u64) {
+    let mut fbs = LEGACY_FB.lock().unwrap();
+    let Some(fb) = fbs.get_mut(&fb_raw) else {
+        return;
+    };
+    let best = ffr_registry::lookup(device_raw, fb.color_image)
+        .into_iter()
+        .max_by_key(|x| x.generation);
+    // No-descriptor uses a sentinel center (-1) so a real one always differs.
+    let (cx, cy, falloff) = match &best {
+        Some(d) => (d.center_px_x, d.center_px_y, d.falloff),
+        None => (-1.0, -1.0, ffr_core::wire::FalloffParams::default()),
+    };
+    if fb.filled
+        && (fb.fill_center_x - cx).abs() < 1.0
+        && (fb.fill_center_y - cy).abs() < 1.0
+        && fb.fill_falloff == falloff
+    {
+        return;
+    }
+    let map = match &best {
+        Some(desc) => ffr_core::foveation::FoveationMap::generate(
+            fb.area.width,
+            fb.area.height,
+            (desc.center_px_x, desc.center_px_y),
+            fb.texel.width.max(1),
+            (fb.area.width as f32 / 2.0, fb.area.height as f32 / 2.0),
+            &desc.falloff,
+        ),
+        None => ffr_core::foveation::FoveationMap {
+            cols: fb.cols,
+            rows: fb.rows,
+            texel_size: fb.texel.width,
+            bytes: vec![0u8; (fb.cols * fb.rows) as usize],
+        },
+    };
+    if upload_map(d, fb.sr_image, &map).is_some() {
+        fb.filled = true;
+        fb.fill_center_x = cx;
+        fb.fill_center_y = cy;
+        fb.fill_falloff = falloff;
+        if best.is_some() && !LOGGED_LEGACY.swap(true, Ordering::Relaxed) {
+            info!(
+                "legacy render-pass VRS active: filled shading-rate map for eye image \
+                 0x{:x} ({}x{} tiles)",
+                fb.color_image, fb.cols, fb.rows
+            );
+        }
+    }
+}
+
+unsafe fn has_color_subpass(ci: &vk::RenderPassCreateInfo2) -> bool {
+    if ci.p_subpasses.is_null() {
+        return false;
+    }
+    std::slice::from_raw_parts(ci.p_subpasses, ci.subpass_count as usize)
+        .iter()
+        .any(|s| s.color_attachment_count > 0)
+}
+
+/// Allocate an (unfilled) R8_UINT shading-rate image + view.
+unsafe fn alloc_sr_image(
+    d: &DeviceData,
+    cols: u32,
+    rows: u32,
+) -> Option<(vk::Image, vk::DeviceMemory, vk::ImageView)> {
+    let dev = &d.device;
+    let image = dev
+        .create_image(
+            &vk::ImageCreateInfo::default()
+                .image_type(vk::ImageType::TYPE_2D)
+                .format(vk::Format::R8_UINT)
+                .extent(vk::Extent3D { width: cols, height: rows, depth: 1 })
+                .mip_levels(1)
+                .array_layers(1)
+                .samples(vk::SampleCountFlags::TYPE_1)
+                .tiling(vk::ImageTiling::OPTIMAL)
+                .usage(
+                    vk::ImageUsageFlags::FRAGMENT_SHADING_RATE_ATTACHMENT_KHR
+                        | vk::ImageUsageFlags::TRANSFER_DST,
+                )
+                .sharing_mode(vk::SharingMode::EXCLUSIVE),
+            None,
+        )
+        .ok()?;
+    let req = dev.get_image_memory_requirements(image);
+    let memory = dev
+        .allocate_memory(
+            &vk::MemoryAllocateInfo::default().allocation_size(req.size).memory_type_index(
+                memory_type(&d.mem_props, req.memory_type_bits, vk::MemoryPropertyFlags::DEVICE_LOCAL),
+            ),
+            None,
+        )
+        .ok()?;
+    dev.bind_image_memory(image, memory, 0).ok()?;
+    let view = dev
+        .create_image_view(
+            &vk::ImageViewCreateInfo::default()
+                .image(image)
+                .view_type(vk::ImageViewType::TYPE_2D)
+                .format(vk::Format::R8_UINT)
+                .subresource_range(vk::ImageSubresourceRange {
+                    aspect_mask: vk::ImageAspectFlags::COLOR,
+                    base_mip_level: 0,
+                    level_count: 1,
+                    base_array_layer: 0,
+                    layer_count: 1,
+                }),
+            None,
+        )
+        .ok()?;
+    Some((image, memory, view))
 }
 
 /// Recreate graphics pipelines with a fragment-shading-rate state that REPLACEs
