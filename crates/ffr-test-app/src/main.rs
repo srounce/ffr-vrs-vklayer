@@ -84,11 +84,12 @@ fn run() -> Result<(), Box<dyn Error>> {
     };
     println!("Per-eye resolution: {}x{}", resolution.width, resolution.height);
 
-    // Debug mode: draw a full-screen background false-colored by the actual
-    // applied shading rate (gl_ShadingRateEXT) so the foveation is visible.
+    // Debug mode: overlay a translucent false-color of the actual applied
+    // shading rate (gl_ShadingRateEXT) on top of the scene so foveation is
+    // visible even when the scene fills the frame.
     let debug_rate = std::env::var_os("FFR_TEST_DEBUG_RATE").is_some();
     if debug_rate {
-        println!("FFR_TEST_DEBUG_RATE: drawing shading-rate false-color background");
+        println!("FFR_TEST_DEBUG_RATE: overlaying shading-rate false-color on the scene");
     }
 
     let _reqs = xr_instance.graphics_requirements::<xr::Vulkan>(system)?;
@@ -284,8 +285,8 @@ fn cube_transform(i: usize, spin: f32) -> (Mat4, [f32; 4]) {
 struct Renderer {
     pipeline_layout: vk::PipelineLayout,
     pipeline: vk::Pipeline,
-    /// Optional full-screen shading-rate visualization pipeline (debug mode).
-    bg_pipeline: Option<vk::Pipeline>,
+    /// Optional full-screen shading-rate overlay pipeline (debug mode).
+    overlay_pipeline: Option<vk::Pipeline>,
     vertex_buffer: vk::Buffer,
     index_buffer: vk::Buffer,
     depth_image: vk::Image,
@@ -326,14 +327,15 @@ impl Renderer {
                 .offset(0)];
             let pipeline = build_pipeline(
                 &vk.device, pipeline_layout, cube_vert, cube_frag, color_format, &bindings, &attrs,
-                true,
+                true, false,
             )?;
             vk.device.destroy_shader_module(cube_vert, None);
             vk.device.destroy_shader_module(cube_frag, None);
 
-            // Debug background: a full-screen triangle (no vertex input, no depth)
-            // that reads the applied shading rate and false-colors it.
-            let bg_pipeline = if debug_rate {
+            // Debug overlay: a full-screen triangle (no vertex input, no depth)
+            // drawn over the scene with alpha blending, reading the applied
+            // shading rate and false-coloring it.
+            let overlay_pipeline = if debug_rate {
                 let fs_vert = load_shader(
                     &vk.device,
                     include_bytes!(concat!(env!("OUT_DIR"), "/fullscreen.vert.spv")),
@@ -344,6 +346,7 @@ impl Renderer {
                 )?;
                 let p = build_pipeline(
                     &vk.device, pipeline_layout, fs_vert, rate_frag, color_format, &[], &[], false,
+                    true,
                 )?;
                 vk.device.destroy_shader_module(fs_vert, None);
                 vk.device.destroy_shader_module(rate_frag, None);
@@ -361,7 +364,7 @@ impl Renderer {
             Ok(Renderer {
                 pipeline_layout,
                 pipeline,
-                bg_pipeline,
+                overlay_pipeline,
                 vertex_buffer,
                 index_buffer,
                 depth_image,
@@ -482,12 +485,7 @@ impl Renderer {
         vk.device
             .cmd_set_scissor(cb, 0, &[vk::Rect2D { offset: vk::Offset2D { x: 0, y: 0 }, extent }]);
 
-        // Debug: full-screen shading-rate visualization behind the cubes.
-        if let Some(bg) = self.bg_pipeline {
-            vk.device.cmd_bind_pipeline(cb, vk::PipelineBindPoint::GRAPHICS, bg);
-            vk.device.cmd_draw(cb, 3, 1, 0, 0);
-        }
-
+        // Scene: the cube ring.
         vk.device.cmd_bind_pipeline(cb, vk::PipelineBindPoint::GRAPHICS, self.pipeline);
         vk.device.cmd_bind_vertex_buffers(cb, 0, &[self.vertex_buffer], &[0]);
         vk.device.cmd_bind_index_buffer(cb, self.index_buffer, 0, vk::IndexType::UINT16);
@@ -503,6 +501,12 @@ impl Renderer {
                 bytes_of_val(&pc),
             );
             vk.device.cmd_draw_indexed(cb, CUBE_INDICES.len() as u32, 1, 0, 0, 0);
+        }
+
+        // Debug: alpha-blended shading-rate overlay on top of the whole scene.
+        if let Some(overlay) = self.overlay_pipeline {
+            vk.device.cmd_bind_pipeline(cb, vk::PipelineBindPoint::GRAPHICS, overlay);
+            vk.device.cmd_draw(cb, 3, 1, 0, 0);
         }
         vk.device.cmd_end_rendering(cb);
     }
@@ -773,6 +777,7 @@ unsafe fn build_pipeline(
     bindings: &[vk::VertexInputBindingDescription],
     attrs: &[vk::VertexInputAttributeDescription],
     depth_test: bool,
+    blend: bool,
 ) -> Result<vk::Pipeline, Box<dyn Error>> {
     let stages = [
         vk::PipelineShaderStageCreateInfo::default()
@@ -802,8 +807,21 @@ unsafe fn build_pipeline(
         .depth_test_enable(depth_test)
         .depth_write_enable(depth_test)
         .depth_compare_op(vk::CompareOp::LESS);
-    let blend_attachments = [vk::PipelineColorBlendAttachmentState::default()
-        .color_write_mask(vk::ColorComponentFlags::RGBA)];
+    let blend_attachment = if blend {
+        vk::PipelineColorBlendAttachmentState::default()
+            .color_write_mask(vk::ColorComponentFlags::RGBA)
+            .blend_enable(true)
+            .src_color_blend_factor(vk::BlendFactor::SRC_ALPHA)
+            .dst_color_blend_factor(vk::BlendFactor::ONE_MINUS_SRC_ALPHA)
+            .color_blend_op(vk::BlendOp::ADD)
+            .src_alpha_blend_factor(vk::BlendFactor::ONE)
+            .dst_alpha_blend_factor(vk::BlendFactor::ZERO)
+            .alpha_blend_op(vk::BlendOp::ADD)
+    } else {
+        vk::PipelineColorBlendAttachmentState::default()
+            .color_write_mask(vk::ColorComponentFlags::RGBA)
+    };
+    let blend_attachments = [blend_attachment];
     let color_blend =
         vk::PipelineColorBlendStateCreateInfo::default().attachments(&blend_attachments);
     let dynamic_states = [vk::DynamicState::VIEWPORT, vk::DynamicState::SCISSOR];

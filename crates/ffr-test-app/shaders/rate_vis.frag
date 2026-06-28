@@ -14,10 +14,11 @@ void main() {
     int cov = w * h;
 
     vec3 c;
-    if (cov <= 1)      c = vec3(0.0, 0.6, 0.0); // 1x1 full — green
-    else if (cov <= 2) c = vec3(0.5, 0.7, 0.0);
-    else if (cov <= 4) c = vec3(0.85, 0.85, 0.0); // 2x2 — yellow
-    else if (cov <= 8) c = vec3(0.95, 0.5, 0.0);
-    else               c = vec3(0.9, 0.0, 0.0); // 4x4 — red
-    out_color = vec4(c, 1.0);
+    if (cov <= 1)      c = vec3(0.0, 1.0, 0.0); // 1x1 full — green
+    else if (cov <= 2) c = vec3(0.6, 1.0, 0.0);
+    else if (cov <= 4) c = vec3(1.0, 1.0, 0.0); // 2x2 — yellow
+    else if (cov <= 8) c = vec3(1.0, 0.5, 0.0);
+    else               c = vec3(1.0, 0.0, 0.0); // 4x4 — red
+    // Semi-transparent so it overlays the scene (alpha-blended on top).
+    out_color = vec4(c, 0.45);
 }
