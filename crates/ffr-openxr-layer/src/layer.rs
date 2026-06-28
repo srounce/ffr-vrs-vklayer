@@ -44,6 +44,8 @@ struct SessionData {
 struct SwapchainData {
     instance: u64,
     vk_device: u64,
+    /// The swapchain's `VkFormat` (raw), for the Vulkan-layer overlay pipeline.
+    format: i32,
     images: Vec<u64>,
 }
 
@@ -273,9 +275,10 @@ unsafe extern "system" fn xr_create_swapchain(
     if res != XrResult::SUCCESS {
         return res;
     }
+    let format = if create_info.is_null() { 0 } else { (*create_info).format as i32 };
     SWAPCHAINS.write().unwrap().insert(
         (*swapchain).into_raw(),
-        SwapchainData { instance: instance_raw, vk_device, images: Vec::new() },
+        SwapchainData { instance: instance_raw, vk_device, format, images: Vec::new() },
     );
     res
 }
@@ -369,10 +372,11 @@ unsafe fn publish_from_frame(info: &FrameEndInfo) {
 
 unsafe fn publish_view(eye: u32, view: &CompositionLayerProjectionView) {
     let sub = view.sub_image;
-    let (vk_device, images) = match SWAPCHAINS.read().unwrap().get(&sub.swapchain.into_raw()) {
-        Some(s) => (s.vk_device, s.images.clone()),
-        None => return,
-    };
+    let (vk_device, vk_format, images) =
+        match SWAPCHAINS.read().unwrap().get(&sub.swapchain.into_raw()) {
+            Some(s) => (s.vk_device, s.format, s.images.clone()),
+            None => return,
+        };
     if vk_device == 0 || images.is_empty() {
         return;
     }
@@ -412,6 +416,8 @@ unsafe fn publish_view(eye: u32, view: &CompositionLayerProjectionView) {
             vk_image: image,
             image_array_index: sub.image_array_index,
             eye,
+            vk_format,
+            _pad2: 0,
             rect_x,
             rect_y,
             rect_w,

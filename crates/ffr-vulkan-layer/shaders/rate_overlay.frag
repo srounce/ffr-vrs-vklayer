@@ -1,8 +1,8 @@
 #version 450
 #extension GL_EXT_fragment_shading_rate : require
 
-// False-color the actual applied fragment shading rate so the foveation
-// pattern is directly visible: green = 1x1 (full), yellow = 2x2, red = 4x4.
+// Layer-side overlay: false-color the actually-applied shading rate so the
+// foveation pattern is visible on top of any game's render.
 layout(location = 0) out vec4 out_color;
 
 void main() {
@@ -19,6 +19,5 @@ void main() {
     else if (cov <= 4) c = vec3(1.0, 1.0, 0.0); // 2x2 — yellow
     else if (cov <= 8) c = vec3(1.0, 0.5, 0.0);
     else               c = vec3(1.0, 0.0, 0.0); // 4x4 — red
-    // Semi-transparent so it overlays the scene (alpha-blended on top).
     out_color = vec4(c, 0.25);
 }

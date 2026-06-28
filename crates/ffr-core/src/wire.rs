@@ -9,7 +9,7 @@ use crate::rate::ShadingRate;
 /// Identifies a valid `FoveationDesc` ("FFR1" little-endian).
 pub const FFR_SHARED_MAGIC: u32 = 0x3152_4646;
 /// Bump whenever the wire layout changes.
-pub const FFR_SHARED_VERSION: u32 = 1;
+pub const FFR_SHARED_VERSION: u32 = 2;
 
 /// Compact rate identifier stored in POD structs (avoids enum-transmute UB).
 #[repr(u8)]
@@ -123,6 +123,9 @@ pub struct FoveationDesc {
     pub vk_image: u64,
     pub image_array_index: u32,
     pub eye: u32,
+    /// The eye image's `VkFormat` (raw `i32`), for building an overlay pipeline.
+    pub vk_format: i32,
+    pub _pad2: u32,
     /// Sub-rectangle of the image this eye renders into (handles double-wide).
     pub rect_x: i32,
     pub rect_y: i32,
@@ -173,6 +176,8 @@ mod tests {
             vk_image: 2,
             image_array_index: 0,
             eye: 0,
+            vk_format: 0,
+            _pad2: 0,
             rect_x: 0,
             rect_y: 0,
             rect_w: 100,

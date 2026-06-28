@@ -155,6 +155,8 @@ mod tests {
             vk_image: image,
             image_array_index: eye,
             eye,
+            vk_format: 0,
+            _pad2: 0,
             rect_x: 0,
             rect_y: 0,
             rect_w: 100,

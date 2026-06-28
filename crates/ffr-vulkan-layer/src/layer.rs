@@ -31,6 +31,14 @@ static KILL: Lazy<bool> = Lazy::new(|| std::env::var_os("FFR_VRS_DISABLE").is_so
 /// (false-colored by rate) so the foveation pattern can be inspected.
 static DEBUG: Lazy<bool> = Lazy::new(|| std::env::var_os("FFR_VRS_DEBUG").is_some());
 
+/// When `FFR_VRS_OVERLAY` is set, the layer draws a translucent false-color of
+/// the applied shading rate over each eye render, so foveation is visible in any
+/// app without modifying it.
+static OVERLAY: Lazy<bool> = Lazy::new(|| std::env::var_os("FFR_VRS_OVERLAY").is_some());
+
+const FULLSCREEN_VERT: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/fullscreen.vert.spv"));
+const RATE_OVERLAY_FRAG: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/rate_overlay.frag.spv"));
+
 /// Down-chain instance state, keyed by `VkInstance` handle.
 struct InstanceData {
     next_gipa: PfnGetInstanceProcAddr,
@@ -86,6 +94,17 @@ struct DeviceData {
     mem_props: vk::PhysicalDeviceMemoryProperties,
     /// Per-eye shading-rate images, created on first injection for each eye.
     vrs_images: Mutex<HashMap<u32, VrsImage>>,
+    /// Cached overlay pipeline (debug viz), keyed by color format + extent.
+    overlay: Mutex<Option<OverlayPipeline>>,
+}
+
+/// The layer's own full-screen shading-rate overlay pipeline.
+struct OverlayPipeline {
+    pipeline: vk::Pipeline,
+    layout: vk::PipelineLayout,
+    color_format: i32,
+    area_w: u32,
+    area_h: u32,
 }
 
 static INSTANCES: Lazy<RwLock<HashMap<u64, InstanceData>>> =
@@ -101,8 +120,23 @@ static VIEW_TO_IMAGE: Lazy<RwLock<HashMap<u64, u64>>> =
 static CB_TO_DEVICE: Lazy<RwLock<HashMap<u64, u64>>> =
     Lazy::new(|| RwLock::new(HashMap::new()));
 
+/// Per-command-buffer state for the eye render currently being recorded, used
+/// to draw the overlay at `vkCmdEndRendering`.
+struct RenderState {
+    color_image: u64,
+    color_view: u64,
+    color_format: i32,
+    render_area: vk::Rect2D,
+    sr_view: u64,
+    texel: vk::Extent2D,
+    multiview: bool,
+}
+static CB_RENDER: Lazy<RwLock<HashMap<u64, RenderState>>> =
+    Lazy::new(|| RwLock::new(HashMap::new()));
+
 static LOGGED_RECOGNIZE: AtomicBool = AtomicBool::new(false);
 static LOGGED_INJECT: AtomicBool = AtomicBool::new(false);
+static LOGGED_OVERLAY: AtomicBool = AtomicBool::new(false);
 
 /// Cast a layer entry-point fn item into the loader's `PFN_vkVoidFunction`.
 macro_rules! vk_fn {
@@ -194,6 +228,7 @@ pub unsafe extern "system" fn get_device_proc_addr(
         b"vkDestroyImageView" => return vk_fn!(destroy_image_view),
         b"vkAllocateCommandBuffers" => return vk_fn!(allocate_command_buffers),
         b"vkCmdBeginRendering" => return vk_fn!(cmd_begin_rendering),
+        b"vkCmdEndRendering" => return vk_fn!(cmd_end_rendering),
         b"vkCreateGraphicsPipelines" => return vk_fn!(create_graphics_pipelines),
         _ => {}
     }
@@ -409,6 +444,7 @@ unsafe extern "system" fn create_device(
             queue_family,
             mem_props,
             vrs_images: Mutex::new(HashMap::new()),
+            overlay: Mutex::new(None),
         },
     );
 
@@ -438,6 +474,10 @@ unsafe extern "system" fn destroy_device(
             d.vrs_images.lock().unwrap().drain().map(|(_, v)| v).collect();
         for img in &images {
             destroy_vrs_image(&d, img);
+        }
+        if let Some(o) = d.overlay.lock().unwrap().take() {
+            d.device.destroy_pipeline(o.pipeline, None);
+            d.device.destroy_pipeline_layout(o.layout, None);
         }
         // Down-chain destroy via the ash wrapper (honors the app's allocator).
         d.device.destroy_device(p_allocator.as_ref());
@@ -568,13 +608,13 @@ unsafe extern "system" fn cmd_begin_rendering(
         return;
     };
 
-    let desc = if p_rendering_info.is_null() {
+    let matched = if p_rendering_info.is_null() {
         None
     } else {
         matched_desc(device_raw, p_rendering_info)
     };
 
-    if let Some(desc) = desc {
+    if let Some((desc, color_view)) = matched {
         if d.vrs.is_some() && !*KILL {
             let area = (*p_rendering_info).render_area;
             if let Some((sr_view, texel)) = ensure_vrs_image(d, &desc, area) {
@@ -589,6 +629,21 @@ unsafe extern "system" fn cmd_begin_rendering(
                     (&attach as *const vk::RenderingFragmentShadingRateAttachmentInfoKHR)
                         .cast::<c_void>();
                 d.device.cmd_begin_rendering(command_buffer, &modified);
+
+                if *OVERLAY {
+                    CB_RENDER.write().unwrap().insert(
+                        command_buffer.as_raw(),
+                        RenderState {
+                            color_image: desc.vk_image,
+                            color_view: color_view.as_raw(),
+                            color_format: desc.vk_format,
+                            render_area: area,
+                            sr_view: sr_view.as_raw(),
+                            texel,
+                            multiview: info.view_mask != 0,
+                        },
+                    );
+                }
                 return;
             }
         }
@@ -597,11 +652,12 @@ unsafe extern "system" fn cmd_begin_rendering(
     d.device.cmd_begin_rendering(command_buffer, &*p_rendering_info);
 }
 
-/// The first OXR-tagged eye descriptor among this render's color attachments.
+/// The first OXR-tagged eye descriptor (and its color view) among this render's
+/// color attachments.
 unsafe fn matched_desc(
     device_raw: u64,
     p_info: *const vk::RenderingInfo,
-) -> Option<ffr_core::wire::FoveationDesc> {
+) -> Option<(ffr_core::wire::FoveationDesc, vk::ImageView)> {
     let info = &*p_info;
     if info.p_color_attachments.is_null() {
         return None;
@@ -622,10 +678,226 @@ unsafe fn matched_desc(
                     d.eye, d.rect_w, d.rect_h, d.center_px_x, d.center_px_y
                 );
             }
-            return Some(*d);
+            return Some((*d, att.image_view));
         }
     }
     None
+}
+
+unsafe extern "system" fn cmd_end_rendering(command_buffer: vk::CommandBuffer) {
+    let device_raw = CB_TO_DEVICE.read().unwrap().get(&command_buffer.as_raw()).copied();
+    let Some(device_raw) = device_raw else {
+        return;
+    };
+    let map = DEVICES.read().unwrap();
+    let Some(d) = map.get(&device_raw) else {
+        return;
+    };
+    // Forward the app's end-rendering first.
+    d.device.cmd_end_rendering(command_buffer);
+
+    // Then, if this was a tagged eye render and the overlay is enabled, draw it
+    // in a separate pass that loads the rendered image and blends on top.
+    let state = CB_RENDER.write().unwrap().remove(&command_buffer.as_raw());
+    if let Some(state) = state {
+        if *OVERLAY && !state.multiview {
+            draw_overlay(d, command_buffer, &state);
+        }
+    }
+}
+
+/// Draw the shading-rate overlay into the eye image (own render pass).
+unsafe fn draw_overlay(d: &DeviceData, cb: vk::CommandBuffer, state: &RenderState) {
+    let Some(pipeline) = ensure_overlay_pipeline(d, state.color_format, state.render_area) else {
+        return;
+    };
+
+    // Wait for the app's color writes before we load + blend.
+    let range = vk::ImageSubresourceRange {
+        aspect_mask: vk::ImageAspectFlags::COLOR,
+        base_mip_level: 0,
+        level_count: 1,
+        base_array_layer: 0,
+        layer_count: 1,
+    };
+    let b = vk::ImageMemoryBarrier::default()
+        .old_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+        .new_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+        .src_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_WRITE)
+        .dst_access_mask(
+            vk::AccessFlags::COLOR_ATTACHMENT_WRITE | vk::AccessFlags::COLOR_ATTACHMENT_READ,
+        )
+        .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+        .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+        .image(vk::Image::from_raw(state.color_image))
+        .subresource_range(range);
+    d.device.cmd_pipeline_barrier(
+        cb,
+        vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
+        vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
+        vk::DependencyFlags::empty(),
+        &[],
+        &[],
+        &[b],
+    );
+
+    let color_att = vk::RenderingAttachmentInfo::default()
+        .image_view(vk::ImageView::from_raw(state.color_view))
+        .image_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+        .load_op(vk::AttachmentLoadOp::LOAD)
+        .store_op(vk::AttachmentStoreOp::STORE);
+    let mut sr_att = vk::RenderingFragmentShadingRateAttachmentInfoKHR::default()
+        .image_view(vk::ImageView::from_raw(state.sr_view))
+        .image_layout(vk::ImageLayout::FRAGMENT_SHADING_RATE_ATTACHMENT_OPTIMAL_KHR)
+        .shading_rate_attachment_texel_size(state.texel);
+    let color_atts = [color_att];
+    let mut rendering = vk::RenderingInfo::default()
+        .render_area(state.render_area)
+        .layer_count(1)
+        .color_attachments(&color_atts);
+    rendering.p_next =
+        (&mut sr_att as *mut vk::RenderingFragmentShadingRateAttachmentInfoKHR).cast::<c_void>();
+
+    d.device.cmd_begin_rendering(cb, &rendering);
+    d.device.cmd_bind_pipeline(cb, vk::PipelineBindPoint::GRAPHICS, pipeline);
+    d.device.cmd_draw(cb, 3, 1, 0, 0);
+    d.device.cmd_end_rendering(cb);
+
+    if !LOGGED_OVERLAY.swap(true, Ordering::Relaxed) {
+        info!("drawing shading-rate overlay on eye render ({}x{})", state.render_area.extent.width, state.render_area.extent.height);
+    }
+}
+
+/// Get/create the overlay pipeline for a given color format + extent.
+unsafe fn ensure_overlay_pipeline(
+    d: &DeviceData,
+    color_format: i32,
+    area: vk::Rect2D,
+) -> Option<vk::Pipeline> {
+    let mut slot = d.overlay.lock().unwrap();
+    if let Some(o) = slot.as_ref() {
+        if o.color_format == color_format
+            && o.area_w == area.extent.width
+            && o.area_h == area.extent.height
+        {
+            return Some(o.pipeline);
+        }
+        d.device.destroy_pipeline(o.pipeline, None);
+        d.device.destroy_pipeline_layout(o.layout, None);
+        *slot = None;
+    }
+
+    let o = build_overlay_pipeline(d, color_format, area)?;
+    let pipeline = o.pipeline;
+    *slot = Some(o);
+    Some(pipeline)
+}
+
+unsafe fn build_overlay_pipeline(
+    d: &DeviceData,
+    color_format: i32,
+    area: vk::Rect2D,
+) -> Option<OverlayPipeline> {
+    let dev = &d.device;
+    let layout = dev
+        .create_pipeline_layout(&vk::PipelineLayoutCreateInfo::default(), None)
+        .ok()?;
+    let vert = load_module(dev, FULLSCREEN_VERT)?;
+    let frag = load_module(dev, RATE_OVERLAY_FRAG)?;
+
+    let stages = [
+        vk::PipelineShaderStageCreateInfo::default()
+            .stage(vk::ShaderStageFlags::VERTEX)
+            .module(vert)
+            .name(c"main"),
+        vk::PipelineShaderStageCreateInfo::default()
+            .stage(vk::ShaderStageFlags::FRAGMENT)
+            .module(frag)
+            .name(c"main"),
+    ];
+    let vertex_input = vk::PipelineVertexInputStateCreateInfo::default();
+    let input_assembly = vk::PipelineInputAssemblyStateCreateInfo::default()
+        .topology(vk::PrimitiveTopology::TRIANGLE_LIST);
+    // Static viewport/scissor so we never touch the app's dynamic state.
+    let viewports = [vk::Viewport {
+        x: area.offset.x as f32,
+        y: area.offset.y as f32,
+        width: area.extent.width as f32,
+        height: area.extent.height as f32,
+        min_depth: 0.0,
+        max_depth: 1.0,
+    }];
+    let scissors = [area];
+    let viewport_state = vk::PipelineViewportStateCreateInfo::default()
+        .viewports(&viewports)
+        .scissors(&scissors);
+    let rasterization = vk::PipelineRasterizationStateCreateInfo::default()
+        .polygon_mode(vk::PolygonMode::FILL)
+        .cull_mode(vk::CullModeFlags::NONE)
+        .front_face(vk::FrontFace::COUNTER_CLOCKWISE)
+        .line_width(1.0);
+    let multisample = vk::PipelineMultisampleStateCreateInfo::default()
+        .rasterization_samples(vk::SampleCountFlags::TYPE_1);
+    let depth_stencil = vk::PipelineDepthStencilStateCreateInfo::default();
+    let blend_attachment = [vk::PipelineColorBlendAttachmentState::default()
+        .color_write_mask(vk::ColorComponentFlags::RGBA)
+        .blend_enable(true)
+        .src_color_blend_factor(vk::BlendFactor::SRC_ALPHA)
+        .dst_color_blend_factor(vk::BlendFactor::ONE_MINUS_SRC_ALPHA)
+        .color_blend_op(vk::BlendOp::ADD)
+        .src_alpha_blend_factor(vk::BlendFactor::ONE)
+        .dst_alpha_blend_factor(vk::BlendFactor::ZERO)
+        .alpha_blend_op(vk::BlendOp::ADD)];
+    let color_blend =
+        vk::PipelineColorBlendStateCreateInfo::default().attachments(&blend_attachment);
+    let color_formats = [vk::Format::from_raw(color_format)];
+    let mut rendering =
+        vk::PipelineRenderingCreateInfo::default().color_attachment_formats(&color_formats);
+    let mut fsr = vk::PipelineFragmentShadingRateStateCreateInfoKHR::default()
+        .fragment_size(vk::Extent2D { width: 1, height: 1 })
+        .combiner_ops([
+            vk::FragmentShadingRateCombinerOpKHR::KEEP,
+            vk::FragmentShadingRateCombinerOpKHR::REPLACE,
+        ]);
+    let info = vk::GraphicsPipelineCreateInfo::default()
+        .stages(&stages)
+        .vertex_input_state(&vertex_input)
+        .input_assembly_state(&input_assembly)
+        .viewport_state(&viewport_state)
+        .rasterization_state(&rasterization)
+        .multisample_state(&multisample)
+        .depth_stencil_state(&depth_stencil)
+        .color_blend_state(&color_blend)
+        .layout(layout)
+        .push_next(&mut rendering)
+        .push_next(&mut fsr);
+
+    let pipeline = dev
+        .create_graphics_pipelines(vk::PipelineCache::null(), &[info], None)
+        .ok()
+        .and_then(|p| p.into_iter().next());
+    dev.destroy_shader_module(vert, None);
+    dev.destroy_shader_module(frag, None);
+    let pipeline = match pipeline {
+        Some(p) => p,
+        None => {
+            dev.destroy_pipeline_layout(layout, None);
+            return None;
+        }
+    };
+
+    Some(OverlayPipeline {
+        pipeline,
+        layout,
+        color_format,
+        area_w: area.extent.width,
+        area_h: area.extent.height,
+    })
+}
+
+unsafe fn load_module(dev: &ash::Device, spv: &[u8]) -> Option<vk::ShaderModule> {
+    let code = ash::util::read_spv(&mut std::io::Cursor::new(spv)).ok()?;
+    dev.create_shader_module(&vk::ShaderModuleCreateInfo::default().code(&code), None).ok()
 }
 
 /// Recreate graphics pipelines with a fragment-shading-rate state that REPLACEs
