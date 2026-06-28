@@ -5,7 +5,12 @@ use std::process::Command;
 
 fn main() {
     let out_dir = std::env::var("OUT_DIR").unwrap();
-    for (src, spv) in [("shaders/cube.vert", "cube.vert.spv"), ("shaders/cube.frag", "cube.frag.spv")] {
+    for (src, spv) in [
+        ("shaders/cube.vert", "cube.vert.spv"),
+        ("shaders/cube.frag", "cube.frag.spv"),
+        ("shaders/fullscreen.vert", "fullscreen.vert.spv"),
+        ("shaders/rate_vis.frag", "rate_vis.frag.spv"),
+    ] {
         println!("cargo:rerun-if-changed={src}");
         let out = Path::new(&out_dir).join(spv);
         let status = Command::new("glslangValidator")

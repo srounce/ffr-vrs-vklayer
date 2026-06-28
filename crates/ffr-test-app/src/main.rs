@@ -84,8 +84,15 @@ fn run() -> Result<(), Box<dyn Error>> {
     };
     println!("Per-eye resolution: {}x{}", resolution.width, resolution.height);
 
+    // Debug mode: draw a full-screen background false-colored by the actual
+    // applied shading rate (gl_ShadingRateEXT) so the foveation is visible.
+    let debug_rate = std::env::var_os("FFR_TEST_DEBUG_RATE").is_some();
+    if debug_rate {
+        println!("FFR_TEST_DEBUG_RATE: drawing shading-rate false-color background");
+    }
+
     let _reqs = xr_instance.graphics_requirements::<xr::Vulkan>(system)?;
-    let vk = VkCtx::new(&xr_instance, system)?;
+    let vk = VkCtx::new(&xr_instance, system, debug_rate)?;
 
     let (session, mut frame_wait, mut frame_stream) = unsafe {
         xr_instance.create_session::<xr::Vulkan>(
@@ -102,7 +109,7 @@ fn run() -> Result<(), Box<dyn Error>> {
 
     let color_format = pick_color_format(&session)?;
     let stage = session.create_reference_space(xr::ReferenceSpaceType::LOCAL, xr::Posef::IDENTITY)?;
-    let renderer = Renderer::new(&vk, color_format, resolution)?;
+    let renderer = Renderer::new(&vk, color_format, resolution, debug_rate)?;
     let mut eyes: Vec<Eye> = (0..2)
         .map(|_| Eye::new(&vk, &session, color_format, resolution))
         .collect::<Result<_, _>>()?;
@@ -277,6 +284,8 @@ fn cube_transform(i: usize, spin: f32) -> (Mat4, [f32; 4]) {
 struct Renderer {
     pipeline_layout: vk::PipelineLayout,
     pipeline: vk::Pipeline,
+    /// Optional full-screen shading-rate visualization pipeline (debug mode).
+    bg_pipeline: Option<vk::Pipeline>,
     vertex_buffer: vk::Buffer,
     index_buffer: vk::Buffer,
     depth_image: vk::Image,
@@ -289,11 +298,12 @@ impl Renderer {
         vk: &VkCtx,
         color_format: vk::Format,
         resolution: vk::Extent2D,
+        debug_rate: bool,
     ) -> Result<Self, Box<dyn Error>> {
         unsafe {
-            let vert =
+            let cube_vert =
                 load_shader(&vk.device, include_bytes!(concat!(env!("OUT_DIR"), "/cube.vert.spv")))?;
-            let frag =
+            let cube_frag =
                 load_shader(&vk.device, include_bytes!(concat!(env!("OUT_DIR"), "/cube.frag.spv")))?;
 
             let push_range = [vk::PushConstantRange::default()
@@ -305,16 +315,6 @@ impl Renderer {
                 None,
             )?;
 
-            let stages = [
-                vk::PipelineShaderStageCreateInfo::default()
-                    .stage(vk::ShaderStageFlags::VERTEX)
-                    .module(vert)
-                    .name(c"main"),
-                vk::PipelineShaderStageCreateInfo::default()
-                    .stage(vk::ShaderStageFlags::FRAGMENT)
-                    .module(frag)
-                    .name(c"main"),
-            ];
             let bindings = [vk::VertexInputBindingDescription::default()
                 .binding(0)
                 .stride(12)
@@ -324,58 +324,33 @@ impl Renderer {
                 .binding(0)
                 .format(vk::Format::R32G32B32_SFLOAT)
                 .offset(0)];
-            let vertex_input = vk::PipelineVertexInputStateCreateInfo::default()
-                .vertex_binding_descriptions(&bindings)
-                .vertex_attribute_descriptions(&attrs);
-            let input_assembly = vk::PipelineInputAssemblyStateCreateInfo::default()
-                .topology(vk::PrimitiveTopology::TRIANGLE_LIST);
-            let viewport_state = vk::PipelineViewportStateCreateInfo::default()
-                .viewport_count(1)
-                .scissor_count(1);
-            let rasterization = vk::PipelineRasterizationStateCreateInfo::default()
-                .polygon_mode(vk::PolygonMode::FILL)
-                .cull_mode(vk::CullModeFlags::NONE)
-                .front_face(vk::FrontFace::COUNTER_CLOCKWISE)
-                .line_width(1.0);
-            let multisample = vk::PipelineMultisampleStateCreateInfo::default()
-                .rasterization_samples(vk::SampleCountFlags::TYPE_1);
-            let depth_stencil = vk::PipelineDepthStencilStateCreateInfo::default()
-                .depth_test_enable(true)
-                .depth_write_enable(true)
-                .depth_compare_op(vk::CompareOp::LESS);
-            let blend_attachments = [vk::PipelineColorBlendAttachmentState::default()
-                .color_write_mask(vk::ColorComponentFlags::RGBA)];
-            let color_blend =
-                vk::PipelineColorBlendStateCreateInfo::default().attachments(&blend_attachments);
-            let dynamic_states = [vk::DynamicState::VIEWPORT, vk::DynamicState::SCISSOR];
-            let dynamic_state =
-                vk::PipelineDynamicStateCreateInfo::default().dynamic_states(&dynamic_states);
+            let pipeline = build_pipeline(
+                &vk.device, pipeline_layout, cube_vert, cube_frag, color_format, &bindings, &attrs,
+                true,
+            )?;
+            vk.device.destroy_shader_module(cube_vert, None);
+            vk.device.destroy_shader_module(cube_frag, None);
 
-            let color_formats = [color_format];
-            let mut rendering = vk::PipelineRenderingCreateInfo::default()
-                .color_attachment_formats(&color_formats)
-                .depth_attachment_format(DEPTH_FORMAT);
-
-            let pipeline_info = vk::GraphicsPipelineCreateInfo::default()
-                .stages(&stages)
-                .vertex_input_state(&vertex_input)
-                .input_assembly_state(&input_assembly)
-                .viewport_state(&viewport_state)
-                .rasterization_state(&rasterization)
-                .multisample_state(&multisample)
-                .depth_stencil_state(&depth_stencil)
-                .color_blend_state(&color_blend)
-                .dynamic_state(&dynamic_state)
-                .layout(pipeline_layout)
-                .push_next(&mut rendering);
-
-            let pipeline = vk
-                .device
-                .create_graphics_pipelines(vk::PipelineCache::null(), &[pipeline_info], None)
-                .map_err(|(_, e)| e)?[0];
-
-            vk.device.destroy_shader_module(vert, None);
-            vk.device.destroy_shader_module(frag, None);
+            // Debug background: a full-screen triangle (no vertex input, no depth)
+            // that reads the applied shading rate and false-colors it.
+            let bg_pipeline = if debug_rate {
+                let fs_vert = load_shader(
+                    &vk.device,
+                    include_bytes!(concat!(env!("OUT_DIR"), "/fullscreen.vert.spv")),
+                )?;
+                let rate_frag = load_shader(
+                    &vk.device,
+                    include_bytes!(concat!(env!("OUT_DIR"), "/rate_vis.frag.spv")),
+                )?;
+                let p = build_pipeline(
+                    &vk.device, pipeline_layout, fs_vert, rate_frag, color_format, &[], &[], false,
+                )?;
+                vk.device.destroy_shader_module(fs_vert, None);
+                vk.device.destroy_shader_module(rate_frag, None);
+                Some(p)
+            } else {
+                None
+            };
 
             let vertex_buffer =
                 vk.create_buffer(bytes_of(&CUBE_VERTS), vk::BufferUsageFlags::VERTEX_BUFFER)?;
@@ -386,6 +361,7 @@ impl Renderer {
             Ok(Renderer {
                 pipeline_layout,
                 pipeline,
+                bg_pipeline,
                 vertex_buffer,
                 index_buffer,
                 depth_image,
@@ -494,7 +470,6 @@ impl Renderer {
             .depth_attachment(&depth_att);
 
         vk.device.cmd_begin_rendering(cb, &rendering);
-        vk.device.cmd_bind_pipeline(cb, vk::PipelineBindPoint::GRAPHICS, self.pipeline);
         let viewport = vk::Viewport {
             x: 0.0,
             y: 0.0,
@@ -506,6 +481,14 @@ impl Renderer {
         vk.device.cmd_set_viewport(cb, 0, &[viewport]);
         vk.device
             .cmd_set_scissor(cb, 0, &[vk::Rect2D { offset: vk::Offset2D { x: 0, y: 0 }, extent }]);
+
+        // Debug: full-screen shading-rate visualization behind the cubes.
+        if let Some(bg) = self.bg_pipeline {
+            vk.device.cmd_bind_pipeline(cb, vk::PipelineBindPoint::GRAPHICS, bg);
+            vk.device.cmd_draw(cb, 3, 1, 0, 0);
+        }
+
+        vk.device.cmd_bind_pipeline(cb, vk::PipelineBindPoint::GRAPHICS, self.pipeline);
         vk.device.cmd_bind_vertex_buffers(cb, 0, &[self.vertex_buffer], &[0]);
         vk.device.cmd_bind_index_buffer(cb, self.index_buffer, 0, vk::IndexType::UINT16);
 
@@ -578,7 +561,11 @@ struct VkCtx {
 }
 
 impl VkCtx {
-    fn new(xr_instance: &xr::Instance, system: xr::SystemId) -> Result<Self, Box<dyn Error>> {
+    fn new(
+        xr_instance: &xr::Instance,
+        system: xr::SystemId,
+        debug_rate: bool,
+    ) -> Result<Self, Box<dyn Error>> {
         let entry = unsafe { ash::Entry::load()? };
         let app_info = vk::ApplicationInfo::default().api_version(vk::make_api_version(0, 1, 3, 0));
         let instance = unsafe {
@@ -608,10 +595,22 @@ impl VkCtx {
         };
 
         let mut vk13 = vk::PhysicalDeviceVulkan13Features::default().dynamic_rendering(true);
+        // In debug mode the app's own pipeline reads gl_ShadingRateEXT, so it must
+        // enable the extension + feature itself (the layer also enables it, but
+        // for the app's pipeline the app must request it at device creation).
+        let mut fsr =
+            vk::PhysicalDeviceFragmentShadingRateFeaturesKHR::default()
+                .attachment_fragment_shading_rate(true);
+        let fsr_ext = [c"VK_KHR_fragment_shading_rate".as_ptr()];
         let priorities = [1.0_f32];
         let queue_info = [vk::DeviceQueueCreateInfo::default()
             .queue_family_index(queue_family_index)
             .queue_priorities(&priorities)];
+        let mut create_info =
+            vk::DeviceCreateInfo::default().queue_create_infos(&queue_info).push_next(&mut vk13);
+        if debug_rate {
+            create_info = create_info.enabled_extension_names(&fsr_ext).push_next(&mut fsr);
+        }
         let device = unsafe {
             let raw = xr_instance
                 .create_vulkan_device(
@@ -620,9 +619,7 @@ impl VkCtx {
                         entry.static_fn().get_instance_proc_addr,
                     ),
                     physical_device.as_raw() as _,
-                    &vk::DeviceCreateInfo::default()
-                        .queue_create_infos(&queue_info)
-                        .push_next(&mut vk13) as *const _ as *const _,
+                    &create_info as *const _ as *const _,
                 )?
                 .map_err(vk::Result::from_raw)?;
             ash::Device::load(instance.fp_v1_0(), vk::Device::from_raw(raw as _))
@@ -762,6 +759,75 @@ unsafe fn load_shader(
 ) -> Result<vk::ShaderModule, Box<dyn Error>> {
     let code = ash::util::read_spv(&mut std::io::Cursor::new(bytes))?;
     Ok(device.create_shader_module(&vk::ShaderModuleCreateInfo::default().code(&code), None)?)
+}
+
+/// Build a dynamic-rendering graphics pipeline. With empty `bindings`/`attrs`
+/// and `depth_test = false` it's a full-screen pass.
+#[allow(clippy::too_many_arguments)]
+unsafe fn build_pipeline(
+    device: &ash::Device,
+    layout: vk::PipelineLayout,
+    vert: vk::ShaderModule,
+    frag: vk::ShaderModule,
+    color_format: vk::Format,
+    bindings: &[vk::VertexInputBindingDescription],
+    attrs: &[vk::VertexInputAttributeDescription],
+    depth_test: bool,
+) -> Result<vk::Pipeline, Box<dyn Error>> {
+    let stages = [
+        vk::PipelineShaderStageCreateInfo::default()
+            .stage(vk::ShaderStageFlags::VERTEX)
+            .module(vert)
+            .name(c"main"),
+        vk::PipelineShaderStageCreateInfo::default()
+            .stage(vk::ShaderStageFlags::FRAGMENT)
+            .module(frag)
+            .name(c"main"),
+    ];
+    let vertex_input = vk::PipelineVertexInputStateCreateInfo::default()
+        .vertex_binding_descriptions(bindings)
+        .vertex_attribute_descriptions(attrs);
+    let input_assembly = vk::PipelineInputAssemblyStateCreateInfo::default()
+        .topology(vk::PrimitiveTopology::TRIANGLE_LIST);
+    let viewport_state =
+        vk::PipelineViewportStateCreateInfo::default().viewport_count(1).scissor_count(1);
+    let rasterization = vk::PipelineRasterizationStateCreateInfo::default()
+        .polygon_mode(vk::PolygonMode::FILL)
+        .cull_mode(vk::CullModeFlags::NONE)
+        .front_face(vk::FrontFace::COUNTER_CLOCKWISE)
+        .line_width(1.0);
+    let multisample = vk::PipelineMultisampleStateCreateInfo::default()
+        .rasterization_samples(vk::SampleCountFlags::TYPE_1);
+    let depth_stencil = vk::PipelineDepthStencilStateCreateInfo::default()
+        .depth_test_enable(depth_test)
+        .depth_write_enable(depth_test)
+        .depth_compare_op(vk::CompareOp::LESS);
+    let blend_attachments = [vk::PipelineColorBlendAttachmentState::default()
+        .color_write_mask(vk::ColorComponentFlags::RGBA)];
+    let color_blend =
+        vk::PipelineColorBlendStateCreateInfo::default().attachments(&blend_attachments);
+    let dynamic_states = [vk::DynamicState::VIEWPORT, vk::DynamicState::SCISSOR];
+    let dynamic_state =
+        vk::PipelineDynamicStateCreateInfo::default().dynamic_states(&dynamic_states);
+    let color_formats = [color_format];
+    let mut rendering = vk::PipelineRenderingCreateInfo::default()
+        .color_attachment_formats(&color_formats)
+        .depth_attachment_format(DEPTH_FORMAT);
+    let info = vk::GraphicsPipelineCreateInfo::default()
+        .stages(&stages)
+        .vertex_input_state(&vertex_input)
+        .input_assembly_state(&input_assembly)
+        .viewport_state(&viewport_state)
+        .rasterization_state(&rasterization)
+        .multisample_state(&multisample)
+        .depth_stencil_state(&depth_stencil)
+        .color_blend_state(&color_blend)
+        .dynamic_state(&dynamic_state)
+        .layout(layout)
+        .push_next(&mut rendering);
+    Ok(device
+        .create_graphics_pipelines(vk::PipelineCache::null(), &[info], None)
+        .map_err(|(_, e)| e)?[0])
 }
 
 fn color_range() -> vk::ImageSubresourceRange {
