@@ -96,8 +96,12 @@ fn run() -> Result<(), Box<dyn Error>> {
     // Render via a classic VkRenderPass instead of dynamic rendering, to drive
     // the layer's legacy render-pass injection path (like xrgears).
     let legacy = std::env::var_os("FFR_TEST_LEGACY").is_some();
+    // Within legacy mode, use the v1 vkCreateRenderPass/vkCmdBeginRenderPass
+    // entry points (like a Vulkan-1.0 app such as xrgears) to exercise the
+    // layer's v1->v2 promotion path.
+    let use_v1 = std::env::var_os("FFR_TEST_RP_V1").is_some();
     if legacy {
-        println!("FFR_TEST_LEGACY: rendering with classic VkRenderPass");
+        println!("FFR_TEST_LEGACY: classic VkRenderPass ({})", if use_v1 { "v1" } else { "v2" });
     }
 
     let _reqs = xr_instance.graphics_requirements::<xr::Vulkan>(system)?;
@@ -118,7 +122,7 @@ fn run() -> Result<(), Box<dyn Error>> {
 
     let color_format = pick_color_format(&session)?;
     let stage = session.create_reference_space(xr::ReferenceSpaceType::LOCAL, xr::Posef::IDENTITY)?;
-    let renderer = Renderer::new(&vk, color_format, resolution, debug_rate, legacy)?;
+    let renderer = Renderer::new(&vk, color_format, resolution, debug_rate, legacy, use_v1)?;
     let mut eyes: Vec<Eye> = (0..2)
         .map(|_| Eye::new(&vk, &session, color_format, resolution))
         .collect::<Result<_, _>>()?;
@@ -303,6 +307,8 @@ struct Renderer {
     /// When set, render via a classic VkRenderPass (to exercise the layer's
     /// legacy render-pass injection path) instead of dynamic rendering.
     legacy: bool,
+    /// Use the v1 (vkCmdBeginRenderPass) entry point rather than v2.
+    use_v1: bool,
     render_pass: vk::RenderPass,
     framebuffers: RefCell<HashMap<u64, vk::Framebuffer>>,
 }
@@ -314,9 +320,12 @@ impl Renderer {
         resolution: vk::Extent2D,
         debug_rate: bool,
         legacy: bool,
+        use_v1: bool,
     ) -> Result<Self, Box<dyn Error>> {
         unsafe {
-            let render_pass = if legacy {
+            let render_pass = if legacy && use_v1 {
+                create_render_pass_v1(&vk.device, color_format)?
+            } else if legacy {
                 create_render_pass(&vk.device, color_format)?
             } else {
                 vk::RenderPass::null()
@@ -391,6 +400,7 @@ impl Renderer {
                 depth_view,
                 resolution,
                 legacy,
+                use_v1,
                 render_pass,
                 framebuffers: RefCell::new(HashMap::new()),
             })
@@ -452,13 +462,19 @@ impl Renderer {
                         extent: self.resolution,
                     })
                     .clear_values(&clears);
-                vk.device.cmd_begin_render_pass2(
-                    cb,
-                    &begin,
-                    &vk::SubpassBeginInfo::default().contents(vk::SubpassContents::INLINE),
-                );
-                self.record_scene(vk, cb, view_proj, spin);
-                vk.device.cmd_end_render_pass2(cb, &vk::SubpassEndInfo::default());
+                if self.use_v1 {
+                    vk.device.cmd_begin_render_pass(cb, &begin, vk::SubpassContents::INLINE);
+                    self.record_scene(vk, cb, view_proj, spin);
+                    vk.device.cmd_end_render_pass(cb);
+                } else {
+                    vk.device.cmd_begin_render_pass2(
+                        cb,
+                        &begin,
+                        &vk::SubpassBeginInfo::default().contents(vk::SubpassContents::INLINE),
+                    );
+                    self.record_scene(vk, cb, view_proj, spin);
+                    vk.device.cmd_end_render_pass2(cb, &vk::SubpassEndInfo::default());
+                }
             } else {
                 // Dynamic rendering does not transition layouts for us.
                 let barriers = [
@@ -616,6 +632,41 @@ unsafe fn create_render_pass(
         .depth_stencil_attachment(&depth_ref)];
     let info = vk::RenderPassCreateInfo2::default().attachments(&attachments).subpasses(&subpasses);
     Ok(device.create_render_pass2(&info, None)?)
+}
+
+/// The same color+depth render pass via the v1 entry point (like xrgears).
+unsafe fn create_render_pass_v1(
+    device: &ash::Device,
+    color_format: vk::Format,
+) -> Result<vk::RenderPass, Box<dyn Error>> {
+    let attachments = [
+        vk::AttachmentDescription::default()
+            .format(color_format)
+            .samples(vk::SampleCountFlags::TYPE_1)
+            .load_op(vk::AttachmentLoadOp::CLEAR)
+            .store_op(vk::AttachmentStoreOp::STORE)
+            .initial_layout(vk::ImageLayout::UNDEFINED)
+            .final_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL),
+        vk::AttachmentDescription::default()
+            .format(DEPTH_FORMAT)
+            .samples(vk::SampleCountFlags::TYPE_1)
+            .load_op(vk::AttachmentLoadOp::CLEAR)
+            .store_op(vk::AttachmentStoreOp::DONT_CARE)
+            .initial_layout(vk::ImageLayout::UNDEFINED)
+            .final_layout(vk::ImageLayout::DEPTH_ATTACHMENT_OPTIMAL),
+    ];
+    let color_refs = [vk::AttachmentReference::default()
+        .attachment(0)
+        .layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)];
+    let depth_ref = vk::AttachmentReference::default()
+        .attachment(1)
+        .layout(vk::ImageLayout::DEPTH_ATTACHMENT_OPTIMAL);
+    let subpasses = [vk::SubpassDescription::default()
+        .pipeline_bind_point(vk::PipelineBindPoint::GRAPHICS)
+        .color_attachments(&color_refs)
+        .depth_stencil_attachment(&depth_ref)];
+    let info = vk::RenderPassCreateInfo::default().attachments(&attachments).subpasses(&subpasses);
+    Ok(device.create_render_pass(&info, None)?)
 }
 
 // ---------------------------------------------------------------------------

@@ -261,10 +261,12 @@ pub unsafe extern "system" fn get_device_proc_addr(
         b"vkCmdBeginRendering" => return vk_fn!(cmd_begin_rendering),
         b"vkCmdEndRendering" => return vk_fn!(cmd_end_rendering),
         b"vkCreateGraphicsPipelines" => return vk_fn!(create_graphics_pipelines),
+        b"vkCreateRenderPass" => return vk_fn!(create_render_pass),
         b"vkCreateRenderPass2" => return vk_fn!(create_render_pass2),
         b"vkDestroyRenderPass" => return vk_fn!(destroy_render_pass),
         b"vkCreateFramebuffer" => return vk_fn!(create_framebuffer),
         b"vkDestroyFramebuffer" => return vk_fn!(destroy_framebuffer),
+        b"vkCmdBeginRenderPass" => return vk_fn!(cmd_begin_render_pass),
         b"vkCmdBeginRenderPass2" => return vk_fn!(cmd_begin_render_pass2),
         _ => {}
     }
@@ -956,8 +958,17 @@ unsafe extern "system" fn create_render_pass2(
         return vk::Result::ERROR_INITIALIZATION_FAILED;
     };
     let ci = &*p_create_info;
-    let augment =
-        d.vrs.is_some() && !*KILL && ci.attachment_count >= 1 && has_color_subpass(ci);
+    let multiview = std::slice::from_raw_parts(ci.p_subpasses, ci.subpass_count as usize)
+        .iter()
+        .any(|s| s.view_mask != 0);
+    if multiview {
+        warn_multiview();
+    }
+    let augment = d.vrs.is_some()
+        && !*KILL
+        && !multiview
+        && ci.attachment_count >= 1
+        && has_color_subpass(ci);
     if !augment {
         return match d.device.create_render_pass2(ci, p_allocator.as_ref()) {
             Ok(rp) => {
@@ -1254,6 +1265,249 @@ unsafe fn alloc_sr_image(
         )
         .ok()?;
     Some((image, memory, view))
+}
+
+static LOGGED_MULTIVIEW: AtomicBool = AtomicBool::new(false);
+fn warn_multiview() {
+    if !LOGGED_MULTIVIEW.swap(true, Ordering::Relaxed) {
+        warn!("multiview render pass detected — VRS injection not yet supported there (M8), passing through");
+    }
+}
+
+/// The image aspect to use for an attachment reference of the given format.
+fn aspect_for(format: vk::Format) -> vk::ImageAspectFlags {
+    match format {
+        vk::Format::D16_UNORM | vk::Format::D32_SFLOAT | vk::Format::X8_D24_UNORM_PACK32 => {
+            vk::ImageAspectFlags::DEPTH
+        }
+        vk::Format::D16_UNORM_S8_UINT
+        | vk::Format::D24_UNORM_S8_UINT
+        | vk::Format::D32_SFLOAT_S8_UINT => {
+            vk::ImageAspectFlags::DEPTH | vk::ImageAspectFlags::STENCIL
+        }
+        vk::Format::S8_UINT => vk::ImageAspectFlags::STENCIL,
+        _ => vk::ImageAspectFlags::COLOR,
+    }
+}
+
+/// `vkCreateRenderPass` (v1) — promote to renderpass2 and augment with the
+/// shading-rate attachment (needed for Vulkan 1.0 apps like xrgears).
+unsafe extern "system" fn create_render_pass(
+    device: vk::Device,
+    p_create_info: *const vk::RenderPassCreateInfo,
+    p_allocator: *const vk::AllocationCallbacks,
+    p_render_pass: *mut vk::RenderPass,
+) -> vk::Result {
+    let map = DEVICES.read().unwrap();
+    let Some(d) = map.get(&device.as_raw()) else {
+        return vk::Result::ERROR_INITIALIZATION_FAILED;
+    };
+    let ci = &*p_create_info;
+    let v1_atts = std::slice::from_raw_parts(ci.p_attachments, ci.attachment_count as usize);
+    let v1_subs = std::slice::from_raw_parts(ci.p_subpasses, ci.subpass_count as usize);
+    let multiview = render_pass_v1_is_multiview(ci);
+    if multiview {
+        warn_multiview();
+    }
+    let augment = d.vrs.is_some()
+        && !*KILL
+        && !multiview
+        && ci.attachment_count >= 1
+        && v1_subs.iter().any(|s| s.color_attachment_count > 0);
+    if !augment {
+        return match d.device.create_render_pass(ci, p_allocator.as_ref()) {
+            Ok(rp) => {
+                *p_render_pass = rp;
+                vk::Result::SUCCESS
+            }
+            Err(e) => e,
+        };
+    }
+    let texel = d.vrs.unwrap().texel_size;
+
+    // Attachments v1 -> v2, plus the appended FSR attachment.
+    let mut atts2: Vec<vk::AttachmentDescription2> = v1_atts
+        .iter()
+        .map(|a| {
+            vk::AttachmentDescription2::default()
+                .flags(a.flags)
+                .format(a.format)
+                .samples(a.samples)
+                .load_op(a.load_op)
+                .store_op(a.store_op)
+                .stencil_load_op(a.stencil_load_op)
+                .stencil_store_op(a.stencil_store_op)
+                .initial_layout(a.initial_layout)
+                .final_layout(a.final_layout)
+        })
+        .collect();
+    let fsr_index = atts2.len() as u32;
+    atts2.push(
+        vk::AttachmentDescription2::default()
+            .format(vk::Format::R8_UINT)
+            .samples(vk::SampleCountFlags::TYPE_1)
+            .load_op(vk::AttachmentLoadOp::LOAD)
+            .store_op(vk::AttachmentStoreOp::DONT_CARE)
+            .stencil_load_op(vk::AttachmentLoadOp::DONT_CARE)
+            .stencil_store_op(vk::AttachmentStoreOp::DONT_CARE)
+            .initial_layout(FSR_LAYOUT)
+            .final_layout(FSR_LAYOUT),
+    );
+
+    let n = v1_subs.len();
+    let translate = |r: &vk::AttachmentReference| {
+        let aspect = if r.attachment == vk::ATTACHMENT_UNUSED {
+            vk::ImageAspectFlags::COLOR
+        } else {
+            aspect_for(v1_atts[r.attachment as usize].format)
+        };
+        vk::AttachmentReference2::default()
+            .attachment(r.attachment)
+            .layout(r.layout)
+            .aspect_mask(aspect)
+    };
+    // Per-subpass reference storage (heap-stable across the outer Vec growth).
+    let mut input_refs: Vec<Vec<vk::AttachmentReference2>> = Vec::with_capacity(n);
+    let mut color_refs: Vec<Vec<vk::AttachmentReference2>> = Vec::with_capacity(n);
+    let mut resolve_refs: Vec<Vec<vk::AttachmentReference2>> = Vec::with_capacity(n);
+    let mut depth_refs: Vec<vk::AttachmentReference2> = Vec::with_capacity(n);
+    let mut has_depth: Vec<bool> = Vec::with_capacity(n);
+    let mut fsr_refs: Vec<vk::AttachmentReference2> = Vec::with_capacity(n);
+    for sub in v1_subs {
+        let inputs = std::slice::from_raw_parts(
+            sub.p_input_attachments,
+            sub.input_attachment_count as usize,
+        )
+        .iter()
+        .map(&translate)
+        .collect();
+        let colors = std::slice::from_raw_parts(
+            sub.p_color_attachments,
+            sub.color_attachment_count as usize,
+        )
+        .iter()
+        .map(&translate)
+        .collect();
+        let resolves: Vec<vk::AttachmentReference2> = if sub.p_resolve_attachments.is_null() {
+            Vec::new()
+        } else {
+            std::slice::from_raw_parts(sub.p_resolve_attachments, sub.color_attachment_count as usize)
+                .iter()
+                .map(&translate)
+                .collect()
+        };
+        input_refs.push(inputs);
+        color_refs.push(colors);
+        resolve_refs.push(resolves);
+        if sub.p_depth_stencil_attachment.is_null() {
+            depth_refs.push(vk::AttachmentReference2::default());
+            has_depth.push(false);
+        } else {
+            depth_refs.push(translate(&*sub.p_depth_stencil_attachment));
+            has_depth.push(true);
+        }
+        fsr_refs.push(
+            vk::AttachmentReference2::default()
+                .attachment(fsr_index)
+                .layout(FSR_LAYOUT)
+                .aspect_mask(vk::ImageAspectFlags::COLOR),
+        );
+    }
+    let mut fsr_infos: Vec<vk::FragmentShadingRateAttachmentInfoKHR> = Vec::with_capacity(n);
+    for fsr_ref in &fsr_refs {
+        let mut info = vk::FragmentShadingRateAttachmentInfoKHR::default()
+            .shading_rate_attachment_texel_size(texel);
+        info.p_fragment_shading_rate_attachment = fsr_ref;
+        fsr_infos.push(info);
+    }
+    let mut subs2: Vec<vk::SubpassDescription2> = Vec::with_capacity(n);
+    for (i, sub) in v1_subs.iter().enumerate() {
+        let mut s = vk::SubpassDescription2::default()
+            .flags(sub.flags)
+            .pipeline_bind_point(sub.pipeline_bind_point)
+            .view_mask(0)
+            .input_attachments(&input_refs[i])
+            .color_attachments(&color_refs[i]);
+        if !resolve_refs[i].is_empty() {
+            s = s.resolve_attachments(&resolve_refs[i]);
+        }
+        if has_depth[i] {
+            s = s.depth_stencil_attachment(&depth_refs[i]);
+        }
+        if sub.preserve_attachment_count > 0 {
+            s = s.preserve_attachments(std::slice::from_raw_parts(
+                sub.p_preserve_attachments,
+                sub.preserve_attachment_count as usize,
+            ));
+        }
+        s.p_next = (&fsr_infos[i] as *const vk::FragmentShadingRateAttachmentInfoKHR).cast();
+        subs2.push(s);
+    }
+    let v1_deps =
+        std::slice::from_raw_parts(ci.p_dependencies, ci.dependency_count as usize);
+    let deps2: Vec<vk::SubpassDependency2> = v1_deps
+        .iter()
+        .map(|dep| {
+            vk::SubpassDependency2::default()
+                .src_subpass(dep.src_subpass)
+                .dst_subpass(dep.dst_subpass)
+                .src_stage_mask(dep.src_stage_mask)
+                .dst_stage_mask(dep.dst_stage_mask)
+                .src_access_mask(dep.src_access_mask)
+                .dst_access_mask(dep.dst_access_mask)
+                .dependency_flags(dep.dependency_flags)
+                .view_offset(0)
+        })
+        .collect();
+
+    let mut info2 = vk::RenderPassCreateInfo2::default()
+        .attachments(&atts2)
+        .subpasses(&subs2)
+        .dependencies(&deps2);
+    info2.flags = ci.flags;
+    let rp = match d.device.create_render_pass2(&info2, p_allocator.as_ref()) {
+        Ok(rp) => rp,
+        Err(e) => return e,
+    };
+    *p_render_pass = rp;
+    LEGACY_RP.write().unwrap().insert(rp.as_raw(), LegacyRp { texel });
+    tracing::debug!("promoted + augmented legacy v1 render pass");
+    vk::Result::SUCCESS
+}
+
+unsafe extern "system" fn cmd_begin_render_pass(
+    command_buffer: vk::CommandBuffer,
+    p_render_pass_begin: *const vk::RenderPassBeginInfo,
+    contents: vk::SubpassContents,
+) {
+    let device_raw = CB_TO_DEVICE.read().unwrap().get(&command_buffer.as_raw()).copied();
+    let Some(device_raw) = device_raw else {
+        return;
+    };
+    let map = DEVICES.read().unwrap();
+    let Some(d) = map.get(&device_raw) else {
+        return;
+    };
+    ensure_legacy_fill(d, device_raw, (*p_render_pass_begin).framebuffer.as_raw());
+    d.device.cmd_begin_render_pass(command_buffer, &*p_render_pass_begin, contents);
+}
+
+/// Whether a v1 render pass uses multiview (via `VkRenderPassMultiviewCreateInfo`).
+unsafe fn render_pass_v1_is_multiview(ci: &vk::RenderPassCreateInfo) -> bool {
+    let mut next = ci.p_next;
+    while !next.is_null() {
+        let base = next as *const vk::BaseInStructure;
+        if (*base).s_type == vk::StructureType::RENDER_PASS_MULTIVIEW_CREATE_INFO {
+            let mv = next as *const vk::RenderPassMultiviewCreateInfo;
+            let masks = std::slice::from_raw_parts(
+                (*mv).p_view_masks,
+                (*mv).subpass_count as usize,
+            );
+            return masks.iter().any(|&m| m != 0);
+        }
+        next = (*base).p_next as *const c_void;
+    }
+    false
 }
 
 /// Recreate graphics pipelines with a fragment-shading-rate state that REPLACEs
