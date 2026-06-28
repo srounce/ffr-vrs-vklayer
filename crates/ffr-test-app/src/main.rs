@@ -4,6 +4,8 @@
 //! FOV and tags the swapchain images, and the Vulkan layer injects variable-rate
 //! shading into these `vkCmdBeginRendering` passes.
 
+use std::cell::RefCell;
+use std::collections::HashMap;
 use std::error::Error;
 
 use ash::vk::{self, Handle};
@@ -91,6 +93,12 @@ fn run() -> Result<(), Box<dyn Error>> {
     if debug_rate {
         println!("FFR_TEST_DEBUG_RATE: overlaying shading-rate false-color on the scene");
     }
+    // Render via a classic VkRenderPass instead of dynamic rendering, to drive
+    // the layer's legacy render-pass injection path (like xrgears).
+    let legacy = std::env::var_os("FFR_TEST_LEGACY").is_some();
+    if legacy {
+        println!("FFR_TEST_LEGACY: rendering with classic VkRenderPass");
+    }
 
     let _reqs = xr_instance.graphics_requirements::<xr::Vulkan>(system)?;
     let vk = VkCtx::new(&xr_instance, system, debug_rate)?;
@@ -110,7 +118,7 @@ fn run() -> Result<(), Box<dyn Error>> {
 
     let color_format = pick_color_format(&session)?;
     let stage = session.create_reference_space(xr::ReferenceSpaceType::LOCAL, xr::Posef::IDENTITY)?;
-    let renderer = Renderer::new(&vk, color_format, resolution, debug_rate)?;
+    let renderer = Renderer::new(&vk, color_format, resolution, debug_rate, legacy)?;
     let mut eyes: Vec<Eye> = (0..2)
         .map(|_| Eye::new(&vk, &session, color_format, resolution))
         .collect::<Result<_, _>>()?;
@@ -285,13 +293,18 @@ fn cube_transform(i: usize, spin: f32) -> (Mat4, [f32; 4]) {
 struct Renderer {
     pipeline_layout: vk::PipelineLayout,
     pipeline: vk::Pipeline,
-    /// Optional full-screen shading-rate overlay pipeline (debug mode).
+    /// Optional full-screen shading-rate overlay pipeline (debug, dynamic only).
     overlay_pipeline: Option<vk::Pipeline>,
     vertex_buffer: vk::Buffer,
     index_buffer: vk::Buffer,
     depth_image: vk::Image,
     depth_view: vk::ImageView,
     resolution: vk::Extent2D,
+    /// When set, render via a classic VkRenderPass (to exercise the layer's
+    /// legacy render-pass injection path) instead of dynamic rendering.
+    legacy: bool,
+    render_pass: vk::RenderPass,
+    framebuffers: RefCell<HashMap<u64, vk::Framebuffer>>,
 }
 
 impl Renderer {
@@ -300,8 +313,14 @@ impl Renderer {
         color_format: vk::Format,
         resolution: vk::Extent2D,
         debug_rate: bool,
+        legacy: bool,
     ) -> Result<Self, Box<dyn Error>> {
         unsafe {
+            let render_pass = if legacy {
+                create_render_pass(&vk.device, color_format)?
+            } else {
+                vk::RenderPass::null()
+            };
             let cube_vert =
                 load_shader(&vk.device, include_bytes!(concat!(env!("OUT_DIR"), "/cube.vert.spv")))?;
             let cube_frag =
@@ -327,15 +346,16 @@ impl Renderer {
                 .offset(0)];
             let pipeline = build_pipeline(
                 &vk.device, pipeline_layout, cube_vert, cube_frag, color_format, &bindings, &attrs,
-                true, false,
+                true, false, render_pass,
             )?;
             vk.device.destroy_shader_module(cube_vert, None);
             vk.device.destroy_shader_module(cube_frag, None);
 
             // Debug overlay: a full-screen triangle (no vertex input, no depth)
             // drawn over the scene with alpha blending, reading the applied
-            // shading rate and false-coloring it.
-            let overlay_pipeline = if debug_rate {
+            // shading rate and false-coloring it. (Dynamic-rendering path only;
+            // in legacy mode use the layer's FFR_VRS_OVERLAY instead.)
+            let overlay_pipeline = if debug_rate && !legacy {
                 let fs_vert = load_shader(
                     &vk.device,
                     include_bytes!(concat!(env!("OUT_DIR"), "/fullscreen.vert.spv")),
@@ -346,7 +366,7 @@ impl Renderer {
                 )?;
                 let p = build_pipeline(
                     &vk.device, pipeline_layout, fs_vert, rate_frag, color_format, &[], &[], false,
-                    true,
+                    true, vk::RenderPass::null(),
                 )?;
                 vk.device.destroy_shader_module(fs_vert, None);
                 vk.device.destroy_shader_module(rate_frag, None);
@@ -370,8 +390,28 @@ impl Renderer {
                 depth_image,
                 depth_view,
                 resolution,
+                legacy,
+                render_pass,
+                framebuffers: RefCell::new(HashMap::new()),
             })
         }
+    }
+
+    fn framebuffer(&self, vk: &VkCtx, color_view: vk::ImageView) -> vk::Framebuffer {
+        let key = color_view.as_raw();
+        if let Some(&fb) = self.framebuffers.borrow().get(&key) {
+            return fb;
+        }
+        let attachments = [color_view, self.depth_view];
+        let info = vk::FramebufferCreateInfo::default()
+            .render_pass(self.render_pass)
+            .attachments(&attachments)
+            .width(self.resolution.width)
+            .height(self.resolution.height)
+            .layers(1);
+        let fb = unsafe { vk.device.create_framebuffer(&info, None) }.expect("framebuffer");
+        self.framebuffers.borrow_mut().insert(key, fb);
+        fb
     }
 
     /// Record + submit a command buffer that draws the cube ring into one eye.
@@ -395,37 +435,62 @@ impl Renderer {
                     .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
             )?;
 
-            // Dynamic rendering does not transition layouts for us.
-            let barriers = [
-                image_barrier(
-                    color_image,
-                    vk::ImageAspectFlags::COLOR,
-                    vk::ImageLayout::UNDEFINED,
-                    vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
-                    vk::AccessFlags::empty(),
-                    vk::AccessFlags::COLOR_ATTACHMENT_WRITE,
-                ),
-                image_barrier(
-                    self.depth_image,
-                    vk::ImageAspectFlags::DEPTH,
-                    vk::ImageLayout::UNDEFINED,
-                    vk::ImageLayout::DEPTH_ATTACHMENT_OPTIMAL,
-                    vk::AccessFlags::empty(),
-                    vk::AccessFlags::DEPTH_STENCIL_ATTACHMENT_WRITE,
-                ),
-            ];
-            vk.device.cmd_pipeline_barrier(
-                cb,
-                vk::PipelineStageFlags::TOP_OF_PIPE,
-                vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT
-                    | vk::PipelineStageFlags::EARLY_FRAGMENT_TESTS,
-                vk::DependencyFlags::empty(),
-                &[],
-                &[],
-                &barriers,
-            );
-
-            self.draw(vk, cb, color_view, view_proj, spin);
+            if self.legacy {
+                // The render pass handles layout transitions and clears.
+                let fb = self.framebuffer(vk, color_view);
+                let clears = [
+                    vk::ClearValue { color: vk::ClearColorValue { float32: [0.01, 0.01, 0.03, 1.0] } },
+                    vk::ClearValue {
+                        depth_stencil: vk::ClearDepthStencilValue { depth: 1.0, stencil: 0 },
+                    },
+                ];
+                let begin = vk::RenderPassBeginInfo::default()
+                    .render_pass(self.render_pass)
+                    .framebuffer(fb)
+                    .render_area(vk::Rect2D {
+                        offset: vk::Offset2D { x: 0, y: 0 },
+                        extent: self.resolution,
+                    })
+                    .clear_values(&clears);
+                vk.device.cmd_begin_render_pass2(
+                    cb,
+                    &begin,
+                    &vk::SubpassBeginInfo::default().contents(vk::SubpassContents::INLINE),
+                );
+                self.record_scene(vk, cb, view_proj, spin);
+                vk.device.cmd_end_render_pass2(cb, &vk::SubpassEndInfo::default());
+            } else {
+                // Dynamic rendering does not transition layouts for us.
+                let barriers = [
+                    image_barrier(
+                        color_image,
+                        vk::ImageAspectFlags::COLOR,
+                        vk::ImageLayout::UNDEFINED,
+                        vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
+                        vk::AccessFlags::empty(),
+                        vk::AccessFlags::COLOR_ATTACHMENT_WRITE,
+                    ),
+                    image_barrier(
+                        self.depth_image,
+                        vk::ImageAspectFlags::DEPTH,
+                        vk::ImageLayout::UNDEFINED,
+                        vk::ImageLayout::DEPTH_ATTACHMENT_OPTIMAL,
+                        vk::AccessFlags::empty(),
+                        vk::AccessFlags::DEPTH_STENCIL_ATTACHMENT_WRITE,
+                    ),
+                ];
+                vk.device.cmd_pipeline_barrier(
+                    cb,
+                    vk::PipelineStageFlags::TOP_OF_PIPE,
+                    vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT
+                        | vk::PipelineStageFlags::EARLY_FRAGMENT_TESTS,
+                    vk::DependencyFlags::empty(),
+                    &[],
+                    &[],
+                    &barriers,
+                );
+                self.draw(vk, cb, color_view, view_proj, spin);
+            }
 
             vk.device.end_command_buffer(cb)?;
             let cbs = [cb];
@@ -473,6 +538,20 @@ impl Renderer {
             .depth_attachment(&depth_att);
 
         vk.device.cmd_begin_rendering(cb, &rendering);
+        self.record_scene(vk, cb, view_proj, spin);
+
+        // Debug: alpha-blended shading-rate overlay on top of the whole scene.
+        if let Some(overlay) = self.overlay_pipeline {
+            vk.device.cmd_bind_pipeline(cb, vk::PipelineBindPoint::GRAPHICS, overlay);
+            vk.device.cmd_draw(cb, 3, 1, 0, 0);
+        }
+        vk.device.cmd_end_rendering(cb);
+    }
+
+    /// Record the cube-ring draws (viewport/scissor + per-cube draws). Shared by
+    /// the dynamic-rendering and legacy render-pass paths.
+    unsafe fn record_scene(&self, vk: &VkCtx, cb: vk::CommandBuffer, view_proj: Mat4, spin: f32) {
+        let extent = self.resolution;
         let viewport = vk::Viewport {
             x: 0.0,
             y: 0.0,
@@ -484,12 +563,9 @@ impl Renderer {
         vk.device.cmd_set_viewport(cb, 0, &[viewport]);
         vk.device
             .cmd_set_scissor(cb, 0, &[vk::Rect2D { offset: vk::Offset2D { x: 0, y: 0 }, extent }]);
-
-        // Scene: the cube ring.
         vk.device.cmd_bind_pipeline(cb, vk::PipelineBindPoint::GRAPHICS, self.pipeline);
         vk.device.cmd_bind_vertex_buffers(cb, 0, &[self.vertex_buffer], &[0]);
         vk.device.cmd_bind_index_buffer(cb, self.index_buffer, 0, vk::IndexType::UINT16);
-
         for i in 0..CUBE_COUNT {
             let (model, tint) = cube_transform(i, spin);
             let pc = PushConstants { mvp: (view_proj * model).to_cols_array(), tint };
@@ -502,14 +578,44 @@ impl Renderer {
             );
             vk.device.cmd_draw_indexed(cb, CUBE_INDICES.len() as u32, 1, 0, 0, 0);
         }
-
-        // Debug: alpha-blended shading-rate overlay on top of the whole scene.
-        if let Some(overlay) = self.overlay_pipeline {
-            vk.device.cmd_bind_pipeline(cb, vk::PipelineBindPoint::GRAPHICS, overlay);
-            vk.device.cmd_draw(cb, 3, 1, 0, 0);
-        }
-        vk.device.cmd_end_rendering(cb);
     }
+}
+
+/// A simple color+depth render pass (renderpass2) for the legacy path.
+unsafe fn create_render_pass(
+    device: &ash::Device,
+    color_format: vk::Format,
+) -> Result<vk::RenderPass, Box<dyn Error>> {
+    let attachments = [
+        vk::AttachmentDescription2::default()
+            .format(color_format)
+            .samples(vk::SampleCountFlags::TYPE_1)
+            .load_op(vk::AttachmentLoadOp::CLEAR)
+            .store_op(vk::AttachmentStoreOp::STORE)
+            .initial_layout(vk::ImageLayout::UNDEFINED)
+            .final_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL),
+        vk::AttachmentDescription2::default()
+            .format(DEPTH_FORMAT)
+            .samples(vk::SampleCountFlags::TYPE_1)
+            .load_op(vk::AttachmentLoadOp::CLEAR)
+            .store_op(vk::AttachmentStoreOp::DONT_CARE)
+            .initial_layout(vk::ImageLayout::UNDEFINED)
+            .final_layout(vk::ImageLayout::DEPTH_ATTACHMENT_OPTIMAL),
+    ];
+    let color_refs = [vk::AttachmentReference2::default()
+        .attachment(0)
+        .layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+        .aspect_mask(vk::ImageAspectFlags::COLOR)];
+    let depth_ref = vk::AttachmentReference2::default()
+        .attachment(1)
+        .layout(vk::ImageLayout::DEPTH_ATTACHMENT_OPTIMAL)
+        .aspect_mask(vk::ImageAspectFlags::DEPTH);
+    let subpasses = [vk::SubpassDescription2::default()
+        .pipeline_bind_point(vk::PipelineBindPoint::GRAPHICS)
+        .color_attachments(&color_refs)
+        .depth_stencil_attachment(&depth_ref)];
+    let info = vk::RenderPassCreateInfo2::default().attachments(&attachments).subpasses(&subpasses);
+    Ok(device.create_render_pass2(&info, None)?)
 }
 
 // ---------------------------------------------------------------------------
@@ -778,6 +884,7 @@ unsafe fn build_pipeline(
     attrs: &[vk::VertexInputAttributeDescription],
     depth_test: bool,
     blend: bool,
+    render_pass: vk::RenderPass,
 ) -> Result<vk::Pipeline, Box<dyn Error>> {
     let stages = [
         vk::PipelineShaderStageCreateInfo::default()
@@ -831,7 +938,7 @@ unsafe fn build_pipeline(
     let mut rendering = vk::PipelineRenderingCreateInfo::default()
         .color_attachment_formats(&color_formats)
         .depth_attachment_format(DEPTH_FORMAT);
-    let info = vk::GraphicsPipelineCreateInfo::default()
+    let mut info = vk::GraphicsPipelineCreateInfo::default()
         .stages(&stages)
         .vertex_input_state(&vertex_input)
         .input_assembly_state(&input_assembly)
@@ -841,8 +948,13 @@ unsafe fn build_pipeline(
         .depth_stencil_state(&depth_stencil)
         .color_blend_state(&color_blend)
         .dynamic_state(&dynamic_state)
-        .layout(layout)
-        .push_next(&mut rendering);
+        .layout(layout);
+    // Legacy: reference a render pass. Dynamic: chain rendering-create-info.
+    if render_pass == vk::RenderPass::null() {
+        info = info.push_next(&mut rendering);
+    } else {
+        info = info.render_pass(render_pass).subpass(0);
+    }
     Ok(device
         .create_graphics_pipelines(vk::PipelineCache::null(), &[info], None)
         .map_err(|(_, e)| e)?[0])
